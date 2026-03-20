@@ -11,8 +11,9 @@ jobs:
     steps:
       - name: Checkout code
         run: |
-          rm -rf /home/dian/projects/sentinel/sentinel-go
-          git clone https://git.winandahartadi.cloud/fallenguava/sentinel-go.git /home/dian/projects/sentinel/sentinel-go
+          cd /home/dian/projects/sentinel/sentinel-go
+          git fetch origin main
+          git reset --hard origin/main
 
       - name: Build
         run: |
