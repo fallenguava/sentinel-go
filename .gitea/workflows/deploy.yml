@@ -10,15 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
+        run: |
+          rm -rf /home/dian/projects/sentinel/sentinel-go
+          git clone https://git.winandahartadi.cloud/fallenguava/sentinel-go.git /home/dian/projects/sentinel/sentinel-go
 
       - name: Build
-        run: go build -o bin/sentinel ./cmd/sentinel/
+        run: |
+          cd /home/dian/projects/sentinel/sentinel-go
+          go build -o bin/sentinel ./cmd/sentinel/
 
       - name: Restart service
         run: sudo systemctl restart sentinel-go
