@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"html"
 	"log"
 	"os"
 	"strconv"
@@ -10,11 +11,14 @@ import (
 	"sync"
 	"time"
 
+	"sentinel-go/internal/alerts"
 	"sentinel-go/internal/auth"
 	"sentinel-go/internal/cctv"
 	"sentinel-go/internal/config"
 	"sentinel-go/internal/database"
 	"sentinel-go/internal/imaging"
+	"sentinel-go/internal/servicectl"
+	"sentinel-go/internal/sysmon"
 	"sentinel-go/internal/telegram"
 )
 
@@ -34,6 +38,8 @@ type Bot struct {
 
 	// Update offset for polling
 	updateOffset int
+
+	alertManager *alerts.Manager
 }
 
 // NewBot creates a new bot instance
@@ -53,6 +59,7 @@ func NewBot(cfg *config.Config, db *database.DB, cctvClient *cctv.Client, telegr
 		intervalMinutes: cfg.CronIntervalMinutes,
 		enabledCameras:  enabledCams,
 		stopScheduler:   make(chan struct{}),
+		alertManager:    alerts.NewManager(telegramClient, time.Duration(cfg.AlertIntervalSeconds)*time.Second),
 	}
 }
 
@@ -60,6 +67,7 @@ func NewBot(cfg *config.Config, db *database.DB, cctvClient *cctv.Client, telegr
 func (b *Bot) Start(ctx context.Context) {
 	// Start the scheduler in a goroutine
 	go b.runScheduler(ctx)
+	go b.alertManager.Start(ctx)
 
 	// Start polling for commands
 	go b.pollUpdates(ctx)
@@ -287,7 +295,11 @@ func (b *Bot) handleCommand(ctx context.Context, chatID string, cmd *telegram.Co
 	case "help", "h":
 		b.handleHelp(ctx, chatID)
 	case "start":
-		b.handleStart(ctx, chatID)
+		if strings.TrimSpace(cmd.Args) == "" {
+			b.handleStart(ctx, chatID)
+		} else {
+			b.handleServiceStart(ctx, chatID, cmd.Args)
+		}
 	case "status":
 		b.handleStatus(ctx, chatID)
 	case "capture", "snap", "c":
@@ -308,6 +320,16 @@ func (b *Bot) handleCommand(ctx context.Context, chatID string, cmd *telegram.Co
 		b.handleLogout(ctx, chatID)
 	case "whoami":
 		b.handleWhoami(ctx, chatID)
+	case "sysinfo", "sys":
+		b.handleSysInfo(ctx, chatID)
+	case "services", "svc":
+		b.handleServices(ctx, chatID)
+	case "logs":
+		b.handleLogs(ctx, chatID, cmd.Args)
+	case "stop":
+		b.handleServiceStop(ctx, chatID, cmd.Args)
+	case "restart", "res":
+		b.handleServiceRestart(ctx, chatID, cmd.Args)
 	default:
 		msg := fmt.Sprintf("❓ Unknown command: /%s\n\nType /help for available commands.", cmd.Name)
 		b.telegramClient.SendMessageToChat(ctx, chatID, msg)
@@ -361,6 +383,20 @@ func (b *Bot) handleHelp(ctx context.Context, chatID string) {
 /list - List all cameras
 /whoami - Your profile
 /ping - Check bot status
+/sysinfo - CPU, RAM, disk usage
+	<i>Shortcut: /sys</i>
+/services - Monitored service states
+	<i>Shortcut: /svc</i>
+/logs [service] - Last 20 log lines
+
+<b>🛠️ Service Control:</b>
+/start [service] - Start service
+/stop [service] - Stop service
+/restart [service] - Restart service
+	<i>Shortcut: /res</i>
+
+Allowed services:
+<code>aurexa-fastify, sentinel-go, gitea, gitea-runner, postgresql, cloudflared, netdata</code>
 
 <b>🔄 Scheduler:</b>
 /scheduler [on/off] - Control auto-capture
@@ -413,6 +449,144 @@ Type /help for available commands.`,
 		time.Now().Format("2006-01-02 15:04:05"))
 
 	b.telegramClient.SendMessageToChat(ctx, chatID, msg)
+}
+
+func (b *Bot) handleSysInfo(ctx context.Context, chatID string) {
+	snapshot, err := sysmon.Collect()
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to collect system info: %v", err))
+		return
+	}
+
+	msg := fmt.Sprintf(`🖥️ <b>System Info</b>
+
+CPU: <b>%.1f%%</b>
+RAM: <b>%s / %s</b> (%.1f%%)
+Disk (/): <b>%s / %s</b> (%.1f%%)
+
+Type /help for commands.`,
+		snapshot.CPUPercent,
+		formatBytes(snapshot.RAMUsed), formatBytes(snapshot.RAMTotal), snapshot.RAMPercent,
+		formatBytes(snapshot.DiskUsed), formatBytes(snapshot.DiskTotal), snapshot.DiskPercent)
+
+	b.telegramClient.SendMessageToChat(ctx, chatID, msg)
+}
+
+func (b *Bot) handleServices(ctx context.Context, chatID string) {
+	statuses, err := servicectl.ListStatuses()
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to list services: %v", err))
+		return
+	}
+
+	lines := []string{"🧩 <b>Service Status</b>", ""}
+	for _, st := range statuses {
+		emoji := "⚪"
+		switch st.Status {
+		case "running":
+			emoji = "🟢"
+		case "stopped":
+			emoji = "🟠"
+		case "failed":
+			emoji = "🔴"
+		}
+		lines = append(lines, fmt.Sprintf("%s <b>%s</b>: %s", emoji, st.Name, st.Status))
+	}
+	lines = append(lines, "", "Type /help for commands.")
+	b.telegramClient.SendMessageToChat(ctx, chatID, strings.Join(lines, "\n"))
+}
+
+func (b *Bot) handleLogs(ctx context.Context, chatID string, args string) {
+	service := strings.TrimSpace(args)
+	if service == "" {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			"Usage: <code>/logs [service]</code>\n\nAllowed services:\n<code>aurexa-fastify, sentinel-go, gitea, gitea-runner, postgresql, cloudflared, netdata</code>")
+		return
+	}
+
+	if !servicectl.IsAllowedService(service) {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ Service not allowed: <b>%s</b>\n\nAllowed services:\n<code>%s</code>",
+				html.EscapeString(service), strings.Join(servicectl.MonitoredServices(), ", ")))
+		return
+	}
+
+	logs, err := servicectl.GetLogs(service, 20)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to fetch logs for %s: %v", service, err))
+		return
+	}
+
+	msg := fmt.Sprintf("📜 <b>Logs: %s</b>\n<code>%s</code>", html.EscapeString(service), html.EscapeString(logs))
+	b.telegramClient.SendMessageToChat(ctx, chatID, msg)
+}
+
+func (b *Bot) handleServiceStart(ctx context.Context, chatID string, args string) {
+	b.handleServiceAction(ctx, chatID, "start", strings.TrimSpace(args), servicectl.Start)
+}
+
+func (b *Bot) handleServiceStop(ctx context.Context, chatID string, args string) {
+	b.handleServiceAction(ctx, chatID, "stop", strings.TrimSpace(args), servicectl.Stop)
+}
+
+func (b *Bot) handleServiceRestart(ctx context.Context, chatID string, args string) {
+	b.handleServiceAction(ctx, chatID, "restart", strings.TrimSpace(args), servicectl.Restart)
+}
+
+func (b *Bot) handleServiceAction(ctx context.Context, chatID, action, service string, fn func(string) error) {
+	if service == "" {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("Usage: <code>/%s [service]</code>\n\nAllowed services:\n<code>%s</code>",
+				action, strings.Join(servicectl.MonitoredServices(), ", ")))
+		return
+	}
+
+	if !servicectl.IsAllowedService(service) {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ Service not allowed: <b>%s</b>\n\nAllowed services:\n<code>%s</code>",
+				html.EscapeString(service), strings.Join(servicectl.MonitoredServices(), ", ")))
+		return
+	}
+
+	if err := fn(service); err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ Failed to %s <b>%s</b>: %s", action, html.EscapeString(service), html.EscapeString(err.Error())))
+		return
+	}
+
+	actionResult := action + "ed"
+	if action == "stop" {
+		actionResult = "stopped"
+	}
+	if action == "start" {
+		actionResult = "started"
+	}
+	if action == "restart" {
+		actionResult = "restarted"
+	}
+
+	status, err := servicectl.GetServiceStatus(service)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("✅ Service <b>%s</b> %s.", html.EscapeString(service), actionResult))
+		return
+	}
+
+	b.telegramClient.SendMessageToChat(ctx, chatID,
+		fmt.Sprintf("✅ Service <b>%s</b> %s. Current status: <b>%s</b>", html.EscapeString(service), actionResult, html.EscapeString(status.Status)))
+}
+
+func formatBytes(v uint64) string {
+	const unit = 1024
+	if v < unit {
+		return fmt.Sprintf("%d B", v)
+	}
+	div, exp := uint64(unit), 0
+	for n := v / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(v)/float64(div), "KMGTPE"[exp])
 }
 
 // handleCapture captures snapshots from specified cameras

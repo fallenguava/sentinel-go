@@ -31,7 +31,8 @@ type Config struct {
 	DBName string
 
 	// Scheduler Configuration
-	CronIntervalMinutes int
+	CronIntervalMinutes  int
+	AlertIntervalSeconds int
 
 	// Camera names (optional, for display purposes)
 	CameraNames map[int]string
@@ -79,6 +80,12 @@ func Load() (*Config, error) {
 	}
 	cfg.CronIntervalMinutes = cronInterval
 
+	alertInterval, err := strconv.Atoi(getEnv("ALERT_INTERVAL_SECONDS", "60"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid ALERT_INTERVAL_SECONDS: %w", err)
+	}
+	cfg.AlertIntervalSeconds = alertInterval
+
 	// Load camera names (optional)
 	// Format: CAM_1_NAME=Front Door, CAM_2_NAME=Backyard, etc.
 	for i := 1; i <= cfg.NumCams; i++ {
@@ -111,6 +118,9 @@ func (c *Config) validate() error {
 	}
 	if c.CronIntervalMinutes <= 0 {
 		return fmt.Errorf("CRON_INTERVAL_MINUTES must be a positive integer")
+	}
+	if c.AlertIntervalSeconds <= 0 {
+		return fmt.Errorf("ALERT_INTERVAL_SECONDS must be a positive integer")
 	}
 	return nil
 }
