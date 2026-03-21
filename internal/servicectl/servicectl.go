@@ -116,7 +116,7 @@ func GetLogs(service string, lines int) (string, error) {
 		lines = 20
 	}
 
-	cmd := exec.Command("journalctl", "-u", service, "-n", fmt.Sprintf("%d", lines), "--no-pager")
+	cmd := exec.Command("sudo", "-n", "journalctl", "-u", service, "-n", fmt.Sprintf("%d", lines), "--no-pager")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("failed to read logs for %s: %w", service, err)
