@@ -127,6 +127,11 @@ func GetLogs(service string, lines int) (string, error) {
 		return "(no logs)", nil
 	}
 
+	logRunes := []rune(logs)
+	if len(logRunes) > 3000 {
+		logs = "[truncated to last 3000 chars]\n" + string(logRunes[len(logRunes)-3000:])
+	}
+
 	return logs, nil
 }
 
