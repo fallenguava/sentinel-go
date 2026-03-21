@@ -22,6 +22,7 @@ type Config struct {
 	// Telegram Configuration
 	TelegramBotToken string
 	TelegramChatID   string
+	AdminChatID      int64
 
 	// Database Configuration
 	DBHost string
@@ -65,6 +66,11 @@ func Load() (*Config, error) {
 	// Telegram Configuration
 	cfg.TelegramBotToken = getEnv("TELEGRAM_BOT_TOKEN", "")
 	cfg.TelegramChatID = getEnv("TELEGRAM_CHAT_ID", "")
+	adminChatID, err := strconv.ParseInt(getEnv("ADMIN_CHAT_ID", "0"), 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ADMIN_CHAT_ID: %w", err)
+	}
+	cfg.AdminChatID = adminChatID
 
 	// Database Configuration
 	cfg.DBHost = getEnv("DB_HOST", "localhost")
@@ -115,6 +121,9 @@ func (c *Config) validate() error {
 	}
 	if c.TelegramChatID == "" {
 		return fmt.Errorf("TELEGRAM_CHAT_ID is required")
+	}
+	if c.AdminChatID <= 0 {
+		return fmt.Errorf("ADMIN_CHAT_ID is required and must be a valid numeric chat ID")
 	}
 	if c.CronIntervalMinutes <= 0 {
 		return fmt.Errorf("CRON_INTERVAL_MINUTES must be a positive integer")

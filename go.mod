@@ -1,13 +1,16 @@
 module sentinel-go
 
-go 1.23.6
+go 1.25.0
 
 require (
 	github.com/icholy/digest v1.1.0
 	github.com/joho/godotenv v1.5.1
 )
 
-require github.com/lib/pq v1.11.2
+require (
+	github.com/lib/pq v1.11.2
+	golang.org/x/crypto v0.23.0
+)
 
 require (
 	github.com/go-ole/go-ole v1.2.6 // indirect

@@ -6,13 +6,13 @@ import (
 	"html"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"sentinel-go/internal/alerts"
-	"sentinel-go/internal/auth"
 	"sentinel-go/internal/cctv"
 	"sentinel-go/internal/config"
 	"sentinel-go/internal/database"
@@ -20,7 +20,31 @@ import (
 	"sentinel-go/internal/servicectl"
 	"sentinel-go/internal/sysmon"
 	"sentinel-go/internal/telegram"
+
+	"golang.org/x/crypto/bcrypt"
 )
+
+const (
+	flowAwaitRegistrationName = "await_registration_name"
+	flowAwaitRegistrationPIN  = "await_registration_pin"
+	flowAwaitLoginPIN         = "await_login_pin"
+	flowAwaitServicePIN       = "await_service_pin"
+)
+
+var pinRegex = regexp.MustCompile(`^\d{6}$`)
+
+type flowState struct {
+	Stage string
+
+	RegistrationName string
+	PendingCommand   *telegram.Command
+
+	LoginAttempts   int
+	LoginLockedTill time.Time
+
+	ServiceAttempts   int
+	ServiceLockedTill time.Time
+}
 
 // Bot handles Telegram bot commands and scheduled captures
 type Bot struct {
@@ -40,6 +64,8 @@ type Bot struct {
 	updateOffset int
 
 	alertManager *alerts.Manager
+	flowMu       sync.Mutex
+	flows        map[int64]*flowState
 }
 
 // NewBot creates a new bot instance
@@ -60,6 +86,7 @@ func NewBot(cfg *config.Config, db *database.DB, cctvClient *cctv.Client, telegr
 		enabledCameras:  enabledCams,
 		stopScheduler:   make(chan struct{}),
 		alertManager:    alerts.NewManager(telegramClient, time.Duration(cfg.AlertIntervalSeconds)*time.Second),
+		flows:           make(map[int64]*flowState),
 	}
 }
 
@@ -109,237 +136,359 @@ func (b *Bot) handleUpdate(ctx context.Context, update telegram.Update) {
 	chatID := update.Message.Chat.ID
 	chatIDStr := strconv.FormatInt(chatID, 10)
 	text := strings.TrimSpace(update.Message.Text)
-
-	// Check if user is authorized
-	authorized, err := b.db.IsAuthorized(ctx, chatID)
+	cmd := telegram.ParseCommand(text)
+	user, err := b.db.GetUser(ctx, chatID)
 	if err != nil {
-		log.Printf("[BOT] Error checking authorization: %v", err)
+		log.Printf("[BOT] Error reading user: %v", err)
 		return
 	}
 
-	// If authorized, handle commands normally
-	if authorized {
-		// Update last seen
-		b.db.UpdateLastSeen(ctx, chatID)
-
-		cmd := telegram.ParseCommand(text)
-		if cmd == nil {
-			// Not a command, ignore
-			return
-		}
-
-		log.Printf("[BOT] [%s] Command: /%s %s", chatIDStr, cmd.Name, cmd.Args)
-		b.handleCommand(ctx, chatIDStr, cmd)
+	if cmd == nil {
+		b.handleInteractiveInput(ctx, chatID, chatIDStr, text, user)
 		return
 	}
 
-	// Check if user exists but is expired (needs renewal)
-	expired, _, err := b.db.IsExpired(ctx, chatID)
-	if err != nil {
-		log.Printf("[BOT] Error checking expiration: %v", err)
-		return
-	}
-
-	if expired {
-		// User exists but authorization expired - handle renewal
-		b.handleRenewal(ctx, chatID, chatIDStr, text)
-		return
-	}
-
-	// Not authorized - handle authentication flow (new user)
-	b.handleAuth(ctx, chatID, chatIDStr, text)
+	b.handleCommandInput(ctx, chatID, chatIDStr, cmd, user)
 }
 
-// handleAuth handles the authentication flow
-func (b *Bot) handleAuth(ctx context.Context, chatID int64, chatIDStr, text string) {
-	// Get current auth state
-	state, err := b.db.GetAuthState(ctx, chatID)
-	if err != nil {
-		log.Printf("[BOT] Error getting auth state: %v", err)
-		return
-	}
+func (b *Bot) handleCommandInput(ctx context.Context, chatID int64, chatIDStr string, cmd *telegram.Command, user *database.User) {
+	flow := b.getFlow(chatID)
 
-	// Check if blocked (too many attempts)
-	if state.Attempts >= 3 {
-		// Check if 10 minutes have passed
-		if time.Since(state.UpdatedAt) < 10*time.Minute {
-			b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetBlockedMessage())
+	if flow.Stage == flowAwaitRegistrationName || flow.Stage == flowAwaitRegistrationPIN || flow.Stage == flowAwaitLoginPIN || flow.Stage == flowAwaitServicePIN {
+		if cmd.Name != "start" {
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "ℹ️ Finish the current authentication step first. Send your PIN or name as requested.")
 			return
 		}
-		// Reset attempts after cooldown
-		state.Attempts = 0
-		state.Step = 0
 	}
 
-	// Handle /start command to begin auth
-	if strings.HasPrefix(strings.ToLower(text), "/start") {
-		state.Step = 1
-		state.Attempts = 0
-		b.db.UpdateAuthState(ctx, state)
-		b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetWelcomeMessage())
+	if user == nil {
+		if cmd.Name == "start" {
+			flow.Stage = flowAwaitRegistrationName
+			flow.RegistrationName = ""
+			flow.PendingCommand = nil
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "👤 Welcome. Please enter your display name to register.")
+			return
+		}
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "🔒 You are not registered. Send /start to begin registration.")
 		return
 	}
 
-	// State machine for authentication
-	switch state.Step {
-	case 0:
-		// Not started, prompt to start
-		b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetUnauthorizedMessage())
+	if user.Status == "pending" {
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "⏳ Your request has been submitted. Please wait for admin approval.")
+		return
+	}
 
-	case 1:
-		// Waiting for name
-		if auth.IsValidName(text) {
-			state.Name = auth.NormalizeName(text)
-			state.Step = 2
-			b.db.UpdateAuthState(ctx, state)
-			b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetSecurityQuestionMessage(state.Name))
-		} else {
-			state.Attempts++
-			b.db.UpdateAuthState(ctx, state)
-			b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetInvalidNameMessage())
+	if user.Status == "rejected" {
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Your access request was rejected.")
+		return
+	}
+
+	active, err := b.db.IsSessionActive(ctx, chatID)
+	if err != nil {
+		log.Printf("[BOT] Error checking session: %v", err)
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Failed to validate your session. Please try again.")
+		return
+	}
+
+	if !active {
+		if flow.LoginLockedTill.After(time.Now()) {
+			remaining := int(time.Until(flow.LoginLockedTill).Minutes()) + 1
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, fmt.Sprintf("🚫 Too many wrong PIN attempts. Try again in about %d minutes.", remaining))
+			return
 		}
+		flow.Stage = flowAwaitLoginPIN
+		flow.PendingCommand = nil
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "🔐 Enter your PIN:")
+		return
+	}
 
-	case 2:
-		// Waiting for security answer
-		if auth.IsValidBirthdayMonth(text) {
-			// Success! Add to authorized users
-			if err := b.db.AddAuthorizedUser(ctx, chatID, state.Name); err != nil {
-				log.Printf("[BOT] Error adding authorized user: %v", err)
-				b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ An error occurred. Please try again.")
+	if err := b.db.TouchSession(ctx, chatID); err != nil {
+		log.Printf("[BOT] Error touching session: %v", err)
+	}
+
+	if !b.canAccessCommand(user.Role, cmd) {
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "⛔ You are not allowed to use this command.")
+		return
+	}
+
+	if b.requiresServicePIN(user.Role, cmd) {
+		confirmed, err := b.db.HasValidServicePINConfirm(ctx, chatID)
+		if err != nil {
+			log.Printf("[BOT] Error checking PIN confirmation: %v", err)
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Failed to verify admin PIN confirmation.")
+			return
+		}
+		if !confirmed {
+			if flow.ServiceLockedTill.After(time.Now()) {
+				remaining := int(time.Until(flow.ServiceLockedTill).Minutes()) + 1
+				b.telegramClient.SendMessageToChat(ctx, chatIDStr, fmt.Sprintf("🚫 Too many wrong PIN attempts for service control. Try again in about %d minutes.", remaining))
 				return
 			}
-			// Reset auth state
-			b.db.ResetAuthState(ctx, chatID)
-			// Send success message with praising image
-			b.sendPraisingImage(ctx, chatIDStr, auth.GetSuccessMessage(state.Name))
-			log.Printf("[BOT] New user authorized: %s (chat %d)", state.Name, chatID)
-		} else {
-			state.Attempts++
-			b.db.UpdateAuthState(ctx, state)
+			flow.Stage = flowAwaitServicePIN
+			flow.PendingCommand = cmd
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "🔐 Enter your PIN to confirm:")
+			return
+		}
+	}
 
-			if state.Attempts >= 3 {
-				b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetBlockedMessage())
-			} else {
-				b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetInvalidAnswerMessage(state.Attempts))
+	b.executeCommand(ctx, chatID, chatIDStr, cmd, user)
+}
+
+func (b *Bot) handleInteractiveInput(ctx context.Context, chatID int64, chatIDStr, text string, user *database.User) {
+	flow := b.getFlow(chatID)
+
+	switch flow.Stage {
+	case flowAwaitRegistrationName:
+		name := strings.TrimSpace(text)
+		if name == "" {
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Name cannot be empty. Please enter your display name.")
+			return
+		}
+		flow.RegistrationName = name
+		flow.Stage = flowAwaitRegistrationPIN
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "🔐 Set a 6-digit PIN:")
+		return
+
+	case flowAwaitRegistrationPIN:
+		pin := strings.TrimSpace(text)
+		if !pinRegex.MatchString(pin) {
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ PIN must be exactly 6 digits.")
+			return
+		}
+
+		hash, err := bcrypt.GenerateFromPassword([]byte(pin), bcrypt.DefaultCost)
+		if err != nil {
+			log.Printf("[BOT] Error hashing PIN: %v", err)
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Failed to save your PIN. Please try again.")
+			return
+		}
+
+		role := "user"
+		status := "pending"
+		if chatID == b.cfg.AdminChatID {
+			role = "admin"
+			status = "approved"
+		}
+
+		requestedName := flow.RegistrationName
+		err = b.db.UpsertUser(ctx, chatID, requestedName, string(hash), role, status)
+		if err != nil {
+			log.Printf("[BOT] Error saving registration: %v", err)
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Failed to submit registration. Please try again.")
+			return
+		}
+
+		flow.Stage = ""
+		flow.RegistrationName = ""
+
+		if status == "approved" {
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "✅ Your access has been approved! Send /help to get started.")
+			return
+		}
+
+		notify := fmt.Sprintf("⏳ New registration request from %s (chat_id: %d). Use /approve %d or /reject %d", html.EscapeString(requestedName), chatID, chatID, chatID)
+		adminChat := strconv.FormatInt(b.cfg.AdminChatID, 10)
+		if err := b.telegramClient.SendMessageToChat(ctx, adminChat, notify); err != nil {
+			log.Printf("[BOT] Failed to notify admin: %v", err)
+		}
+
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "⏳ Your request has been submitted. Please wait for admin approval.")
+		return
+
+	case flowAwaitLoginPIN:
+		if user == nil || user.Status != "approved" {
+			flow.Stage = ""
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Your account is not approved.")
+			return
+		}
+		if flow.LoginLockedTill.After(time.Now()) {
+			remaining := int(time.Until(flow.LoginLockedTill).Minutes()) + 1
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, fmt.Sprintf("🚫 Too many wrong PIN attempts. Try again in about %d minutes.", remaining))
+			return
+		}
+
+		if bcrypt.CompareHashAndPassword([]byte(user.PinHash), []byte(strings.TrimSpace(text))) != nil {
+			flow.LoginAttempts++
+			if flow.LoginAttempts >= 3 {
+				flow.LoginLockedTill = time.Now().Add(10 * time.Minute)
+				flow.LoginAttempts = 0
+				b.telegramClient.SendMessageToChat(ctx, chatIDStr, "🚫 Too many wrong PIN attempts. Login is locked for 10 minutes.")
+				return
 			}
+			remaining := 3 - flow.LoginAttempts
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, fmt.Sprintf("❌ Wrong PIN. %d attempt(s) remaining.", remaining))
+			return
 		}
+
+		if err := b.db.CreateOrRefreshSession(ctx, chatID); err != nil {
+			log.Printf("[BOT] Error creating session: %v", err)
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Failed to create session. Please try again.")
+			return
+		}
+
+		flow.Stage = ""
+		flow.LoginAttempts = 0
+		flow.PendingCommand = nil
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "✅ Login successful.")
+		return
+
+	case flowAwaitServicePIN:
+		if user == nil || user.Status != "approved" {
+			flow.Stage = ""
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Your account is not approved.")
+			return
+		}
+		if flow.ServiceLockedTill.After(time.Now()) {
+			remaining := int(time.Until(flow.ServiceLockedTill).Minutes()) + 1
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, fmt.Sprintf("🚫 Too many wrong PIN attempts for service control. Try again in about %d minutes.", remaining))
+			return
+		}
+
+		if bcrypt.CompareHashAndPassword([]byte(user.PinHash), []byte(strings.TrimSpace(text))) != nil {
+			flow.ServiceAttempts++
+			if flow.ServiceAttempts >= 3 {
+				flow.ServiceLockedTill = time.Now().Add(10 * time.Minute)
+				flow.ServiceAttempts = 0
+				b.telegramClient.SendMessageToChat(ctx, chatIDStr, "🚫 Too many wrong PIN attempts. Service control is locked for 10 minutes.")
+				return
+			}
+			remaining := 3 - flow.ServiceAttempts
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, fmt.Sprintf("❌ Wrong PIN. %d attempt(s) remaining.", remaining))
+			return
+		}
+
+		if err := b.db.SetPinConfirmed(ctx, chatID); err != nil {
+			log.Printf("[BOT] Error setting PIN confirmation: %v", err)
+			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ Failed to confirm PIN.")
+			return
+		}
+
+		pending := flow.PendingCommand
+		flow.Stage = ""
+		flow.ServiceAttempts = 0
+		flow.PendingCommand = nil
+
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, "✅ PIN confirmed.")
+		if pending != nil {
+			b.executeCommand(ctx, chatID, chatIDStr, pending, user)
+		}
+		return
 	}
 }
 
-// handleRenewal handles the authorization renewal flow for expired users
-func (b *Bot) handleRenewal(ctx context.Context, chatID int64, chatIDStr, text string) {
-	// Get existing user info
-	user, err := b.db.GetAuthorizedUser(ctx, chatID)
-	if err != nil || user == nil {
-		// User doesn't exist, redirect to normal auth
-		b.handleAuth(ctx, chatID, chatIDStr, text)
-		return
-	}
+func (b *Bot) executeCommand(ctx context.Context, chatID int64, chatIDStr string, cmd *telegram.Command, user *database.User) {
+	log.Printf("[BOT] [%s] Command: /%s %s", chatIDStr, cmd.Name, cmd.Args)
 
-	// Get current auth state
-	state, err := b.db.GetAuthState(ctx, chatID)
-	if err != nil {
-		log.Printf("[BOT] Error getting auth state: %v", err)
-		return
-	}
-
-	// Check if blocked (too many attempts)
-	if state.Attempts >= 3 {
-		if time.Since(state.UpdatedAt) < 10*time.Minute {
-			b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetBlockedMessage())
-			return
-		}
-		// Reset attempts after cooldown
-		state.Attempts = 0
-		state.Step = 0
-	}
-
-	// If not in renewal state (step 10), start renewal
-	if state.Step != 10 {
-		// Any message triggers renewal prompt
-		state.Step = 10
-		state.Name = user.Name // Preserve the name
-		b.db.UpdateAuthState(ctx, state)
-		b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetExpiredMessage(user.Name))
-		return
-	}
-
-	// Step 10: Waiting for security answer for renewal
-	if auth.IsValidBirthdayMonth(text) {
-		// Success! Renew authorization
-		if err := b.db.RenewAuthorization(ctx, chatID); err != nil {
-			log.Printf("[BOT] Error renewing authorization: %v", err)
-			b.telegramClient.SendMessageToChat(ctx, chatIDStr, "❌ An error occurred. Please try again.")
-			return
-		}
-		// Reset auth state
-		b.db.ResetAuthState(ctx, chatID)
-		// Send renewed message with praising image
-		b.sendPraisingImage(ctx, chatIDStr, auth.GetRenewedMessage(user.Name))
-		log.Printf("[BOT] User authorization renewed: %s (chat %d)", user.Name, chatID)
-	} else {
-		state.Attempts++
-		b.db.UpdateAuthState(ctx, state)
-
-		if state.Attempts >= 3 {
-			b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetBlockedMessage())
-		} else {
-			b.telegramClient.SendMessageToChat(ctx, chatIDStr, auth.GetInvalidAnswerMessage(state.Attempts))
-		}
-	}
-}
-
-// handleCommand routes commands to their handlers
-func (b *Bot) handleCommand(ctx context.Context, chatID string, cmd *telegram.Command) {
 	switch cmd.Name {
 	case "help", "h":
-		b.handleHelp(ctx, chatID)
+		b.handleHelp(ctx, chatIDStr, user.Role)
 	case "start":
 		if strings.TrimSpace(cmd.Args) == "" {
-			b.handleStart(ctx, chatID)
+			b.handleStart(ctx, chatIDStr)
 		} else {
-			b.handleServiceStart(ctx, chatID, cmd.Args)
+			b.handleServiceStart(ctx, chatIDStr, cmd.Args)
 		}
 	case "status":
-		b.handleStatus(ctx, chatID)
+		b.handleStatus(ctx, chatIDStr)
 	case "capture", "snap", "c":
-		b.handleCapture(ctx, chatID, cmd.Args)
+		b.handleCapture(ctx, chatIDStr, cmd.Args)
 	case "interval", "int":
-		b.handleInterval(ctx, chatID, cmd.Args)
+		b.handleInterval(ctx, chatIDStr, cmd.Args)
 	case "enable", "on":
-		b.handleEnable(ctx, chatID, cmd.Args)
+		b.handleEnable(ctx, chatIDStr, cmd.Args)
 	case "disable", "off":
-		b.handleDisable(ctx, chatID, cmd.Args)
+		b.handleDisable(ctx, chatIDStr, cmd.Args)
 	case "list", "cams", "cameras":
-		b.handleList(ctx, chatID)
+		b.handleList(ctx, chatIDStr)
 	case "scheduler", "sched":
-		b.handleScheduler(ctx, chatID, cmd.Args)
+		b.handleScheduler(ctx, chatIDStr, cmd.Args)
 	case "ping":
-		b.handlePing(ctx, chatID)
-	case "logout":
-		b.handleLogout(ctx, chatID)
+		b.handlePing(ctx, chatIDStr)
 	case "whoami":
-		b.handleWhoami(ctx, chatID)
+		b.handleWhoami(ctx, chatIDStr)
 	case "sysinfo", "sys":
-		b.handleSysInfo(ctx, chatID)
+		b.handleSysInfo(ctx, chatIDStr)
 	case "services", "svc":
-		b.handleServices(ctx, chatID)
+		b.handleServices(ctx, chatIDStr)
 	case "logs":
-		b.handleLogs(ctx, chatID, cmd.Args)
+		b.handleLogs(ctx, chatIDStr, cmd.Args)
 	case "stop":
-		b.handleServiceStop(ctx, chatID, cmd.Args)
+		b.handleServiceStop(ctx, chatIDStr, cmd.Args)
 	case "restart", "res":
-		b.handleServiceRestart(ctx, chatID, cmd.Args)
+		b.handleServiceRestart(ctx, chatIDStr, cmd.Args)
+	case "approve":
+		b.handleApprove(ctx, chatIDStr, cmd.Args)
+	case "reject":
+		b.handleReject(ctx, chatIDStr, cmd.Args)
+	case "users":
+		b.handleUsers(ctx, chatIDStr)
+	case "revoke":
+		b.handleRevoke(ctx, chatIDStr, cmd.Args)
+	case "promote":
+		b.handlePromote(ctx, chatIDStr, cmd.Args)
 	default:
 		msg := fmt.Sprintf("❓ Unknown command: /%s\n\nType /help for available commands.", cmd.Name)
-		b.telegramClient.SendMessageToChat(ctx, chatID, msg)
+		b.telegramClient.SendMessageToChat(ctx, chatIDStr, msg)
 	}
+}
+
+func (b *Bot) canAccessCommand(role string, cmd *telegram.Command) bool {
+	if role == "admin" {
+		return true
+	}
+
+	allowed := map[string]bool{
+		"start":     true,
+		"help":      true,
+		"h":         true,
+		"capture":   true,
+		"snap":      true,
+		"c":         true,
+		"interval":  true,
+		"int":       true,
+		"enable":    true,
+		"on":        true,
+		"disable":   true,
+		"off":       true,
+		"list":      true,
+		"cams":      true,
+		"cameras":   true,
+		"status":    true,
+		"scheduler": true,
+		"sched":     true,
+		"ping":      true,
+		"whoami":    true,
+	}
+
+	return allowed[cmd.Name]
+}
+
+func (b *Bot) requiresServicePIN(role string, cmd *telegram.Command) bool {
+	if role != "admin" {
+		return false
+	}
+	if cmd.Name == "start" && strings.TrimSpace(cmd.Args) != "" {
+		return true
+	}
+	return cmd.Name == "stop" || cmd.Name == "restart" || cmd.Name == "res" || cmd.Name == "services" || cmd.Name == "svc" || cmd.Name == "logs" || cmd.Name == "sysinfo" || cmd.Name == "sys"
+}
+
+func (b *Bot) getFlow(chatID int64) *flowState {
+	b.flowMu.Lock()
+	defer b.flowMu.Unlock()
+
+	state, ok := b.flows[chatID]
+	if !ok {
+		state = &flowState{}
+		b.flows[chatID] = state
+	}
+	return state
 }
 
 // handleStart sends welcome message for authenticated users
 func (b *Bot) handleStart(ctx context.Context, chatID string) {
 	chatIDInt, _ := strconv.ParseInt(chatID, 10, 64)
-	user, _ := b.db.GetAuthorizedUser(ctx, chatIDInt)
+	user, _ := b.db.GetUser(ctx, chatIDInt)
 
 	name := "User"
 	if user != nil {
@@ -357,8 +506,9 @@ Type /help to see all available commands.`, name, b.cfg.NumCams, b.cfg.DVRIP, b.
 }
 
 // handleHelp sends the help message
-func (b *Bot) handleHelp(ctx context.Context, chatID string) {
-	help := `📋 <b>Sentinel-GO Commands</b>
+func (b *Bot) handleHelp(ctx context.Context, chatID, role string) {
+	if role == "admin" {
+		help := `📋 <b>Sentinel-GO Commands (Admin)</b>
 
 <b>📷 Capture:</b>
 /capture [cams] - Capture snapshot(s)
@@ -402,12 +552,164 @@ Allowed services:
 /scheduler [on/off] - Control auto-capture
   <i>Shortcut: /sched</i>
 
-<b>🔐 Account:</b>
-/logout - Revoke your access
+<b>👑 Admin:</b>
+/approve [chat_id] - Approve registration
+/reject [chat_id] - Reject registration
+/users - List approved users
+/revoke [chat_id] - Revoke user access
+/promote [chat_id] - Promote to admin
+
+Type /help anytime to see this menu.`
+
+		b.telegramClient.SendMessageToChat(ctx, chatID, help)
+		return
+	}
+
+	help := `📋 <b>Sentinel-GO Commands</b>
+
+<b>📷 Capture:</b>
+/capture [cams] - Capture snapshot(s)
+  <i>Shortcuts: /c, /snap</i>
+
+<b>⚙️ Settings:</b>
+/interval [min] - Set capture interval
+  <i>Shortcut: /int</i>
+/enable [cams] - Enable camera(s)
+/disable [cams] - Disable camera(s)
+  <i>Shortcuts: /on, /off</i>
+
+<b>📊 Info:</b>
+/status - Current settings
+/list - List all cameras
+/whoami - Your profile
+/ping - Check bot status
+
+<b>🔄 Scheduler:</b>
+/scheduler [on/off] - Control auto-capture
+  <i>Shortcut: /sched</i>
 
 Type /help anytime to see this menu.`
 
 	b.telegramClient.SendMessageToChat(ctx, chatID, help)
+}
+
+func (b *Bot) handleApprove(ctx context.Context, chatID, args string) {
+	targetChatID, err := parseChatIDArg(args)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "Usage: <code>/approve [chat_id]</code>")
+		return
+	}
+
+	ok, err := b.db.ApproveUser(ctx, targetChatID)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to approve: %v", err))
+		return
+	}
+	if !ok {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "❌ User not found.")
+		return
+	}
+
+	targetChat := strconv.FormatInt(targetChatID, 10)
+	_ = b.telegramClient.SendMessageToChat(ctx, targetChat, "✅ Your access has been approved! Send /help to get started.")
+	b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("✅ Approved chat_id %d", targetChatID))
+}
+
+func (b *Bot) handleReject(ctx context.Context, chatID, args string) {
+	targetChatID, err := parseChatIDArg(args)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "Usage: <code>/reject [chat_id]</code>")
+		return
+	}
+
+	ok, err := b.db.RejectUser(ctx, targetChatID)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to reject: %v", err))
+		return
+	}
+	if !ok {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "❌ User not found.")
+		return
+	}
+
+	targetChat := strconv.FormatInt(targetChatID, 10)
+	_ = b.telegramClient.SendMessageToChat(ctx, targetChat, "❌ Your access request was rejected.")
+	b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("✅ Rejected chat_id %d", targetChatID))
+}
+
+func (b *Bot) handleUsers(ctx context.Context, chatID string) {
+	users, err := b.db.ListApprovedUsers(ctx)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to list users: %v", err))
+		return
+	}
+
+	if len(users) == 0 {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "ℹ️ No approved users found.")
+		return
+	}
+
+	lines := []string{"👥 <b>Approved Users</b>", ""}
+	for _, user := range users {
+		lines = append(lines, fmt.Sprintf("• %s (%d) - %s", html.EscapeString(user.Name), user.ChatID, user.Role))
+	}
+	b.telegramClient.SendMessageToChat(ctx, chatID, strings.Join(lines, "\n"))
+}
+
+func (b *Bot) handleRevoke(ctx context.Context, chatID, args string) {
+	targetChatID, err := parseChatIDArg(args)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "Usage: <code>/revoke [chat_id]</code>")
+		return
+	}
+
+	ok, err := b.db.RevokeUser(ctx, targetChatID)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to revoke: %v", err))
+		return
+	}
+	if !ok {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "❌ User not found.")
+		return
+	}
+
+	targetChat := strconv.FormatInt(targetChatID, 10)
+	_ = b.telegramClient.SendMessageToChat(ctx, targetChat, "❌ Your access has been revoked.")
+	b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("✅ Revoked chat_id %d", targetChatID))
+}
+
+func (b *Bot) handlePromote(ctx context.Context, chatID, args string) {
+	targetChatID, err := parseChatIDArg(args)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "Usage: <code>/promote [chat_id]</code>")
+		return
+	}
+
+	ok, err := b.db.PromoteUser(ctx, targetChatID)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to promote: %v", err))
+		return
+	}
+	if !ok {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "❌ User not found.")
+		return
+	}
+
+	targetChat := strconv.FormatInt(targetChatID, 10)
+	_ = b.telegramClient.SendMessageToChat(ctx, targetChat, "✅ You have been promoted to admin.")
+	b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("✅ Promoted chat_id %d to admin", targetChatID))
+}
+
+func parseChatIDArg(args string) (int64, error) {
+	value := strings.TrimSpace(args)
+	if value == "" {
+		return 0, fmt.Errorf("missing")
+	}
+	chatID, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return chatID, nil
 }
 
 // handleStatus sends the current status
@@ -797,48 +1099,42 @@ func (b *Bot) handlePing(ctx context.Context, chatID string) {
 // handleLogout logs out the user
 func (b *Bot) handleLogout(ctx context.Context, chatID string) {
 	chatIDInt, _ := strconv.ParseInt(chatID, 10, 64)
-
-	if err := b.db.RemoveAuthorizedUser(ctx, chatIDInt); err != nil {
-		log.Printf("[BOT] Error removing user: %v", err)
+	if err := b.db.ClearSession(ctx, chatIDInt); err != nil {
+		log.Printf("[BOT] Error clearing session: %v", err)
 		b.telegramClient.SendMessageToChat(ctx, chatID, "❌ Error logging out. Please try again.")
 		return
 	}
-
-	b.db.ResetAuthState(ctx, chatIDInt)
-	b.telegramClient.SendMessageToChat(ctx, chatID, auth.GetLogoutMessage())
-	log.Printf("[BOT] User logged out: chat %d", chatIDInt)
+	b.telegramClient.SendMessageToChat(ctx, chatID, "👋 Logged out. Send /start and enter PIN to login again.")
 }
 
 // handleWhoami shows user profile
 func (b *Bot) handleWhoami(ctx context.Context, chatID string) {
 	chatIDInt, _ := strconv.ParseInt(chatID, 10, 64)
-	user, err := b.db.GetAuthorizedUser(ctx, chatIDInt)
+	user, err := b.db.GetUser(ctx, chatIDInt)
 	if err != nil || user == nil {
 		b.telegramClient.SendMessageToChat(ctx, chatID, "❓ Could not retrieve your profile.\n\nType /help for commands.")
 		return
 	}
-
-	// Calculate days remaining
-	daysRemaining := int(time.Until(user.ExpiresAt).Hours() / 24)
-	expiryStatus := fmt.Sprintf("%s (%d days left)", user.ExpiresAt.Format("2006-01-02"), daysRemaining)
-	if daysRemaining <= 1 {
-		expiryStatus = fmt.Sprintf("⚠️ %s (expiring soon!)", user.ExpiresAt.Format("2006-01-02 15:04"))
+	session, _ := b.db.GetSession(ctx, chatIDInt)
+	sessionStatus := "Not logged in"
+	if session != nil && session.ExpiresAt.After(time.Now()) {
+		sessionStatus = fmt.Sprintf("Active (expires %s)", session.ExpiresAt.Format("2006-01-02 15:04"))
 	}
 
 	msg := fmt.Sprintf(`👤 <b>Your Profile</b>
 
 📛 <b>Name:</b> %s
 🆔 <b>Chat ID:</b> %d
-📅 <b>Authorized:</b> %s
-⏰ <b>Expires:</b> %s
-👁️ <b>Last Active:</b> %s
+🎖️ <b>Role:</b> %s
+📌 <b>Status:</b> %s
+🔑 <b>Session:</b> %s
 
 Type /help for commands.`,
 		user.Name,
 		user.ChatID,
-		user.CreatedAt.Format("2006-01-02 15:04"),
-		expiryStatus,
-		user.LastSeen.Format("2006-01-02 15:04"))
+		user.Role,
+		user.Status,
+		sessionStatus)
 
 	b.telegramClient.SendMessageToChat(ctx, chatID, msg)
 }
@@ -895,7 +1191,7 @@ func (b *Bot) runScheduler(ctx context.Context) {
 
 // sendScheduledCapture sends scheduled captures to all authorized users
 func (b *Bot) sendScheduledCapture(ctx context.Context, cameras []int) {
-	users, err := b.db.GetAllAuthorizedUsers(ctx)
+	users, err := b.db.ListApprovedUsers(ctx)
 	if err != nil {
 		log.Printf("[SCHEDULER] Error getting authorized users: %v", err)
 		return

@@ -10,34 +10,36 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// DB holds the database connection
+const (
+	sessionDuration       = 72 * time.Hour
+	servicePINValidWindow = 10 * time.Minute
+)
+
+// DB holds the database connection.
 type DB struct {
 	conn *sql.DB
 }
 
-// AuthDuration is how long authorization lasts
-const AuthDuration = 7 * 24 * time.Hour // 7 days
-
-// AuthorizedUser represents an authorized user in the database
-type AuthorizedUser struct {
-	ID        int64
-	ChatID    int64
-	Name      string
-	CreatedAt time.Time
-	ExpiresAt time.Time
-	LastSeen  time.Time
+// User stores registration and role details.
+type User struct {
+	ChatID     int64
+	Name       string
+	PinHash    string
+	Role       string
+	Status     string
+	CreatedAt  time.Time
+	ApprovedAt sql.NullTime
 }
 
-// AuthState represents the authentication state of a user
-type AuthState struct {
-	ChatID    int64
-	Step      int    // 0 = not started, 1 = asked name, 2 = asked security question
-	Name      string // Name provided in step 1
-	Attempts  int    // Failed attempts
-	UpdatedAt time.Time
+// Session stores login and admin service PIN confirmation state.
+type Session struct {
+	ChatID         int64
+	LoggedInAt     time.Time
+	ExpiresAt      time.Time
+	PinConfirmedAt sql.NullTime
 }
 
-// New creates a new database connection
+// New creates a new database connection.
 func New(host, port, user, password, dbname string) (*DB, error) {
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		host, port, user, password, dbname)
@@ -47,7 +49,6 @@ func New(host, port, user, password, dbname string) (*DB, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Test the connection
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -56,8 +57,6 @@ func New(host, port, user, password, dbname string) (*DB, error) {
 	}
 
 	db := &DB{conn: conn}
-
-	// Initialize tables
 	if err := db.initTables(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize tables: %w", err)
 	}
@@ -66,29 +65,30 @@ func New(host, port, user, password, dbname string) (*DB, error) {
 	return db, nil
 }
 
-// initTables creates the necessary tables if they don't exist
 func (db *DB) initTables(ctx context.Context) error {
 	queries := []string{
-		`CREATE TABLE IF NOT EXISTS authorized_users (
-			id SERIAL PRIMARY KEY,
-			chat_id BIGINT UNIQUE NOT NULL,
-			name VARCHAR(100) NOT NULL,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			expires_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP + INTERVAL '7 days',
-			last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-		)`,
-		// Add expires_at column if it doesn't exist (for migration)
-		`DO $$ BEGIN
-			ALTER TABLE authorized_users ADD COLUMN expires_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP + INTERVAL '7 days';
-		EXCEPTION WHEN duplicate_column THEN END $$`,
-		`CREATE TABLE IF NOT EXISTS auth_states (
+		`CREATE TABLE IF NOT EXISTS users (
 			chat_id BIGINT PRIMARY KEY,
-			step INTEGER DEFAULT 0,
-			name VARCHAR(100) DEFAULT '',
-			attempts INTEGER DEFAULT 0,
-			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			name VARCHAR(100) NOT NULL,
+			pin_hash VARCHAR(255) NOT NULL,
+			role VARCHAR(20) NOT NULL DEFAULT 'user',
+			status VARCHAR(20) NOT NULL DEFAULT 'pending',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			approved_at TIMESTAMP NULL,
+			CHECK (role IN ('admin', 'user')),
+			CHECK (status IN ('pending', 'approved', 'rejected'))
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_authorized_users_chat_id ON authorized_users(chat_id)`,
+		`CREATE TABLE IF NOT EXISTS sessions (
+			chat_id BIGINT PRIMARY KEY,
+			logged_in_at TIMESTAMP NOT NULL,
+			expires_at TIMESTAMP NOT NULL,
+			pin_confirmed_at TIMESTAMP NULL,
+			CONSTRAINT fk_sessions_user FOREIGN KEY (chat_id)
+			REFERENCES users(chat_id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)`,
 	}
 
 	for _, query := range queries {
@@ -101,151 +101,232 @@ func (db *DB) initTables(ctx context.Context) error {
 	return nil
 }
 
-// IsAuthorized checks if a chat ID is authorized and not expired
-func (db *DB) IsAuthorized(ctx context.Context, chatID int64) (bool, error) {
-	var exists bool
+// UpsertUser stores registration details and status.
+func (db *DB) UpsertUser(ctx context.Context, chatID int64, name, pinHash, role, status string) error {
+	if role != "admin" {
+		role = "user"
+	}
+	if status != "approved" && status != "rejected" {
+		status = "pending"
+	}
+
+	approvedAtExpr := "NULL"
+	if status == "approved" {
+		approvedAtExpr = "CURRENT_TIMESTAMP"
+	}
+
+	query := fmt.Sprintf(`INSERT INTO users (chat_id, name, pin_hash, role, status, created_at, approved_at)
+		VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, %s)
+		ON CONFLICT (chat_id) DO UPDATE SET
+		name = EXCLUDED.name,
+		pin_hash = EXCLUDED.pin_hash,
+		role = EXCLUDED.role,
+		status = EXCLUDED.status,
+		approved_at = CASE WHEN EXCLUDED.status = 'approved' THEN CURRENT_TIMESTAMP ELSE NULL END`, approvedAtExpr)
+
+	_, err := db.conn.ExecContext(ctx, query, chatID, name, pinHash, role, status)
+	return err
+}
+
+// GetUser returns a user record by chat ID.
+func (db *DB) GetUser(ctx context.Context, chatID int64) (*User, error) {
+	u := &User{}
 	err := db.conn.QueryRowContext(ctx,
-		"SELECT EXISTS(SELECT 1 FROM authorized_users WHERE chat_id = $1 AND expires_at > CURRENT_TIMESTAMP)",
-		chatID).Scan(&exists)
-	if err != nil {
-		return false, err
-	}
-	return exists, nil
-}
-
-// IsExpired checks if a user's authorization has expired
-func (db *DB) IsExpired(ctx context.Context, chatID int64) (bool, *AuthorizedUser, error) {
-	user := &AuthorizedUser{}
-	err := db.conn.QueryRowContext(ctx,
-		"SELECT id, chat_id, name, created_at, expires_at, last_seen FROM authorized_users WHERE chat_id = $1",
-		chatID).Scan(&user.ID, &user.ChatID, &user.Name, &user.CreatedAt, &user.ExpiresAt, &user.LastSeen)
-	if err == sql.ErrNoRows {
-		return false, nil, nil // User doesn't exist, not expired
-	}
-	if err != nil {
-		return false, nil, err
-	}
-	// User exists, check if expired
-	return time.Now().After(user.ExpiresAt), user, nil
-}
-
-// AddAuthorizedUser adds a new authorized user with 7-day expiry
-func (db *DB) AddAuthorizedUser(ctx context.Context, chatID int64, name string) error {
-	_, err := db.conn.ExecContext(ctx,
-		`INSERT INTO authorized_users (chat_id, name, created_at, expires_at, last_seen) 
-		 VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '7 days', CURRENT_TIMESTAMP)
-		 ON CONFLICT (chat_id) DO UPDATE SET 
-		 name = $2, expires_at = CURRENT_TIMESTAMP + INTERVAL '7 days', last_seen = CURRENT_TIMESTAMP`,
-		chatID, name)
-	return err
-}
-
-// RenewAuthorization extends the user's authorization by 7 days
-func (db *DB) RenewAuthorization(ctx context.Context, chatID int64) error {
-	_, err := db.conn.ExecContext(ctx,
-		"UPDATE authorized_users SET expires_at = CURRENT_TIMESTAMP + INTERVAL '7 days', last_seen = CURRENT_TIMESTAMP WHERE chat_id = $1",
-		chatID)
-	return err
-}
-
-// UpdateLastSeen updates the last seen timestamp for a user
-func (db *DB) UpdateLastSeen(ctx context.Context, chatID int64) error {
-	_, err := db.conn.ExecContext(ctx,
-		"UPDATE authorized_users SET last_seen = CURRENT_TIMESTAMP WHERE chat_id = $1",
-		chatID)
-	return err
-}
-
-// GetAuthState gets the current authentication state for a chat
-func (db *DB) GetAuthState(ctx context.Context, chatID int64) (*AuthState, error) {
-	state := &AuthState{ChatID: chatID}
-	err := db.conn.QueryRowContext(ctx,
-		"SELECT step, name, attempts, updated_at FROM auth_states WHERE chat_id = $1",
-		chatID).Scan(&state.Step, &state.Name, &state.Attempts, &state.UpdatedAt)
-
-	if err == sql.ErrNoRows {
-		// Create new state
-		_, err = db.conn.ExecContext(ctx,
-			"INSERT INTO auth_states (chat_id, step, name, attempts) VALUES ($1, 0, '', 0)",
-			chatID)
-		if err != nil {
-			return nil, err
-		}
-		state.Step = 0
-		state.Name = ""
-		state.Attempts = 0
-		state.UpdatedAt = time.Now()
-		return state, nil
-	}
-
-	if err != nil {
-		return nil, err
-	}
-	return state, nil
-}
-
-// UpdateAuthState updates the authentication state
-func (db *DB) UpdateAuthState(ctx context.Context, state *AuthState) error {
-	_, err := db.conn.ExecContext(ctx,
-		`INSERT INTO auth_states (chat_id, step, name, attempts, updated_at) 
-		 VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-		 ON CONFLICT (chat_id) DO UPDATE SET 
-		 step = $2, name = $3, attempts = $4, updated_at = CURRENT_TIMESTAMP`,
-		state.ChatID, state.Step, state.Name, state.Attempts)
-	return err
-}
-
-// ResetAuthState resets the authentication state for a chat
-func (db *DB) ResetAuthState(ctx context.Context, chatID int64) error {
-	_, err := db.conn.ExecContext(ctx,
-		"UPDATE auth_states SET step = 0, name = '', attempts = 0, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $1",
-		chatID)
-	return err
-}
-
-// GetAuthorizedUser gets an authorized user by chat ID
-func (db *DB) GetAuthorizedUser(ctx context.Context, chatID int64) (*AuthorizedUser, error) {
-	user := &AuthorizedUser{}
-	err := db.conn.QueryRowContext(ctx,
-		"SELECT id, chat_id, name, created_at, expires_at, last_seen FROM authorized_users WHERE chat_id = $1",
-		chatID).Scan(&user.ID, &user.ChatID, &user.Name, &user.CreatedAt, &user.ExpiresAt, &user.LastSeen)
+		`SELECT chat_id, name, pin_hash, role, status, created_at, approved_at
+		 FROM users WHERE chat_id = $1`,
+		chatID,
+	).Scan(&u.ChatID, &u.Name, &u.PinHash, &u.Role, &u.Status, &u.CreatedAt, &u.ApprovedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return user, nil
+	return u, nil
 }
 
-// RemoveAuthorizedUser removes an authorized user
-func (db *DB) RemoveAuthorizedUser(ctx context.Context, chatID int64) error {
-	_, err := db.conn.ExecContext(ctx,
-		"DELETE FROM authorized_users WHERE chat_id = $1", chatID)
-	return err
+// ApproveUser approves a pending user.
+func (db *DB) ApproveUser(ctx context.Context, chatID int64) (bool, error) {
+	res, err := db.conn.ExecContext(ctx,
+		`UPDATE users
+		 SET status = 'approved', approved_at = CURRENT_TIMESTAMP
+		 WHERE chat_id = $1`,
+		chatID,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, _ := res.RowsAffected()
+	return affected > 0, nil
 }
 
-// GetAllAuthorizedUsers returns all authorized users (not expired)
-func (db *DB) GetAllAuthorizedUsers(ctx context.Context) ([]*AuthorizedUser, error) {
+// RejectUser rejects a user request.
+func (db *DB) RejectUser(ctx context.Context, chatID int64) (bool, error) {
+	res, err := db.conn.ExecContext(ctx,
+		`UPDATE users
+		 SET status = 'rejected', approved_at = NULL
+		 WHERE chat_id = $1`,
+		chatID,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, _ := res.RowsAffected()
+	if affected > 0 {
+		_, _ = db.conn.ExecContext(ctx, "DELETE FROM sessions WHERE chat_id = $1", chatID)
+	}
+	return affected > 0, nil
+}
+
+// PromoteUser sets a user role to admin.
+func (db *DB) PromoteUser(ctx context.Context, chatID int64) (bool, error) {
+	res, err := db.conn.ExecContext(ctx,
+		`UPDATE users
+		 SET role = 'admin', status = 'approved', approved_at = COALESCE(approved_at, CURRENT_TIMESTAMP)
+		 WHERE chat_id = $1`,
+		chatID,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, _ := res.RowsAffected()
+	return affected > 0, nil
+}
+
+// RevokeUser removes a user and active session.
+func (db *DB) RevokeUser(ctx context.Context, chatID int64) (bool, error) {
+	res, err := db.conn.ExecContext(ctx, "DELETE FROM users WHERE chat_id = $1", chatID)
+	if err != nil {
+		return false, err
+	}
+	affected, _ := res.RowsAffected()
+	return affected > 0, nil
+}
+
+// ListApprovedUsers returns all approved users.
+func (db *DB) ListApprovedUsers(ctx context.Context) ([]*User, error) {
 	rows, err := db.conn.QueryContext(ctx,
-		"SELECT id, chat_id, name, created_at, expires_at, last_seen FROM authorized_users WHERE expires_at > CURRENT_TIMESTAMP ORDER BY created_at")
+		`SELECT chat_id, name, pin_hash, role, status, created_at, approved_at
+		 FROM users
+		 WHERE status = 'approved'
+		 ORDER BY created_at`,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var users []*AuthorizedUser
+	users := make([]*User, 0)
 	for rows.Next() {
-		user := &AuthorizedUser{}
-		if err := rows.Scan(&user.ID, &user.ChatID, &user.Name, &user.CreatedAt, &user.ExpiresAt, &user.LastSeen); err != nil {
+		u := &User{}
+		if err := rows.Scan(&u.ChatID, &u.Name, &u.PinHash, &u.Role, &u.Status, &u.CreatedAt, &u.ApprovedAt); err != nil {
 			return nil, err
 		}
-		users = append(users, user)
+		users = append(users, u)
 	}
 	return users, nil
 }
 
-// Close closes the database connection
+// CreateOrRefreshSession resets login session for a user.
+func (db *DB) CreateOrRefreshSession(ctx context.Context, chatID int64) error {
+	_, err := db.conn.ExecContext(ctx,
+		`INSERT INTO sessions (chat_id, logged_in_at, expires_at, pin_confirmed_at)
+		 VALUES ($1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '3 days', NULL)
+		 ON CONFLICT (chat_id) DO UPDATE SET
+		 logged_in_at = CURRENT_TIMESTAMP,
+		 expires_at = CURRENT_TIMESTAMP + INTERVAL '3 days',
+		 pin_confirmed_at = NULL`,
+		chatID,
+	)
+	return err
+}
+
+// TouchSession extends session expiry based on activity.
+func (db *DB) TouchSession(ctx context.Context, chatID int64) error {
+	_, err := db.conn.ExecContext(ctx,
+		`UPDATE sessions
+		 SET expires_at = CURRENT_TIMESTAMP + INTERVAL '3 days'
+		 WHERE chat_id = $1`,
+		chatID,
+	)
+	return err
+}
+
+// IsSessionActive checks whether a valid session exists.
+func (db *DB) IsSessionActive(ctx context.Context, chatID int64) (bool, error) {
+	var exists bool
+	err := db.conn.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM sessions WHERE chat_id = $1 AND expires_at > CURRENT_TIMESTAMP)`,
+		chatID,
+	).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// GetSession returns session details.
+func (db *DB) GetSession(ctx context.Context, chatID int64) (*Session, error) {
+	s := &Session{}
+	err := db.conn.QueryRowContext(ctx,
+		`SELECT chat_id, logged_in_at, expires_at, pin_confirmed_at
+		 FROM sessions WHERE chat_id = $1`,
+		chatID,
+	).Scan(&s.ChatID, &s.LoggedInAt, &s.ExpiresAt, &s.PinConfirmedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// SetPinConfirmed marks that admin PIN was confirmed for service commands.
+func (db *DB) SetPinConfirmed(ctx context.Context, chatID int64) error {
+	_, err := db.conn.ExecContext(ctx,
+		`UPDATE sessions SET pin_confirmed_at = CURRENT_TIMESTAMP WHERE chat_id = $1`,
+		chatID,
+	)
+	return err
+}
+
+// HasValidServicePINConfirm checks if admin service PIN confirmation is still valid.
+func (db *DB) HasValidServicePINConfirm(ctx context.Context, chatID int64) (bool, error) {
+	var exists bool
+	err := db.conn.QueryRowContext(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM sessions
+			WHERE chat_id = $1
+			  AND pin_confirmed_at IS NOT NULL
+			  AND pin_confirmed_at > CURRENT_TIMESTAMP - INTERVAL '10 minutes'
+			  AND expires_at > CURRENT_TIMESTAMP
+		)`,
+		chatID,
+	).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// ClearSession removes active session data.
+func (db *DB) ClearSession(ctx context.Context, chatID int64) error {
+	_, err := db.conn.ExecContext(ctx, "DELETE FROM sessions WHERE chat_id = $1", chatID)
+	return err
+}
+
+// SessionDuration returns login session lifetime.
+func SessionDuration() time.Duration {
+	return sessionDuration
+}
+
+// ServicePINWindow returns how long service PIN confirmation remains valid.
+func ServicePINWindow() time.Duration {
+	return servicePINValidWindow
+}
+
+// Close closes the database connection.
 func (db *DB) Close() error {
 	return db.conn.Close()
 }
