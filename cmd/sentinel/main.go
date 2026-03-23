@@ -12,6 +12,7 @@ import (
 	"sentinel-go/internal/config"
 	"sentinel-go/internal/database"
 	"sentinel-go/internal/telegram"
+	"sentinel-go/internal/webcam"
 )
 
 func main() {
@@ -40,6 +41,7 @@ func main() {
 
 	// Initialize clients
 	cctvClient := cctv.NewClient(cfg.DVRIP, cfg.DVRPort, cfg.DVRUser, cfg.DVRPass)
+	webcamClient := webcam.NewClient(cfg.WebcamDeviceName, cfg.WebcamFFmpegPath, cfg.WebcamCaptureDir)
 	telegramClient := telegram.NewClient(cfg.TelegramBotToken, cfg.TelegramChatID)
 
 	// Create a context for graceful shutdown
@@ -58,8 +60,13 @@ func main() {
 		log.Println("[MAIN] Will continue anyway - DVR might become available later")
 	}
 
+	if err := webcamClient.HealthCheck(ctx); err != nil {
+		log.Printf("[MAIN] WARNING: Webcam health check failed: %v", err)
+		log.Println("[MAIN] Will continue anyway - Webcam might become available later")
+	}
+
 	// Create and start the bot
-	botInstance := bot.NewBot(cfg, db, cctvClient, telegramClient)
+	botInstance := bot.NewBot(cfg, db, cctvClient, webcamClient, telegramClient)
 	botInstance.Start(ctx)
 
 	log.Println("[MAIN] Bot is now running. Waiting for authenticated users...")

@@ -20,6 +20,7 @@ import (
 	"sentinel-go/internal/servicectl"
 	"sentinel-go/internal/sysmon"
 	"sentinel-go/internal/telegram"
+	"sentinel-go/internal/webcam"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -51,6 +52,7 @@ type Bot struct {
 	cfg            *config.Config
 	db             *database.DB
 	cctvClient     *cctv.Client
+	webcamClient   *webcam.Client
 	telegramClient *telegram.Client
 
 	// Scheduler state
@@ -69,7 +71,7 @@ type Bot struct {
 }
 
 // NewBot creates a new bot instance
-func NewBot(cfg *config.Config, db *database.DB, cctvClient *cctv.Client, telegramClient *telegram.Client) *Bot {
+func NewBot(cfg *config.Config, db *database.DB, cctvClient *cctv.Client, webcamClient *webcam.Client, telegramClient *telegram.Client) *Bot {
 	// Initialize all cameras as enabled by default
 	enabledCams := make(map[int]bool)
 	for i := 1; i <= cfg.NumCams; i++ {
@@ -80,6 +82,7 @@ func NewBot(cfg *config.Config, db *database.DB, cctvClient *cctv.Client, telegr
 		cfg:             cfg,
 		db:              db,
 		cctvClient:      cctvClient,
+		webcamClient:    webcamClient,
 		telegramClient:  telegramClient,
 		schedulerActive: true,
 		intervalMinutes: cfg.CronIntervalMinutes,
@@ -392,6 +395,8 @@ func (b *Bot) executeCommand(ctx context.Context, chatID int64, chatIDStr string
 		b.handleStatus(ctx, chatIDStr)
 	case "capture", "snap", "c":
 		b.handleCapture(ctx, chatIDStr, cmd.Args)
+	case "cam", "webcam":
+		b.handleCam(ctx, chatIDStr)
 	case "interval", "int":
 		b.handleInterval(ctx, chatIDStr, cmd.Args)
 	case "enable", "on":
@@ -444,6 +449,8 @@ func (b *Bot) canAccessCommand(role string, cmd *telegram.Command) bool {
 		"capture":   true,
 		"snap":      true,
 		"c":         true,
+		"cam":       true,
+		"webcam":    true,
 		"interval":  true,
 		"int":       true,
 		"enable":    true,
@@ -519,6 +526,9 @@ func (b *Bot) handleHelp(ctx context.Context, chatID, role string) {
   <code>/capture all</code> - All cameras
   <i>Shortcuts: /c, /snap</i>
 
+/cam - Capture laptop webcam (on-demand)
+  <i>Shortcut: /webcam</i>
+
 <b>⚙️ Settings:</b>
 /interval [min] - Set capture interval
   <code>/interval 30</code> - Every 30 min
@@ -570,6 +580,9 @@ Type /help anytime to see this menu.`
 <b>📷 Capture:</b>
 /capture [cams] - Capture snapshot(s)
   <i>Shortcuts: /c, /snap</i>
+
+/cam - Capture laptop webcam (on-demand)
+  <i>Shortcut: /webcam</i>
 
 <b>⚙️ Settings:</b>
 /interval [min] - Set capture interval
@@ -924,6 +937,29 @@ func (b *Bot) handleCapture(ctx context.Context, chatID string, args string) {
 		fmt.Sprintf("📷 Capturing from %d camera(s)...", len(cameras)))
 
 	b.captureAndSend(ctx, chatID, cameras, false)
+}
+
+// handleCam captures a frame from the laptop webcam and sends it via Telegram
+func (b *Bot) handleCam(ctx context.Context, chatID string) {
+	b.telegramClient.SendMessageToChat(ctx, chatID, "📷 Opening webcam...")
+
+	captureCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	imageData, contentType, err := b.webcamClient.CaptureFrame(captureCtx)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ Webcam capture failed: %v\n\nType /help for commands.", err))
+		return
+	}
+
+	caption := fmt.Sprintf("🖥️ Laptop Cam\n🕐 %s", time.Now().Format("2006-01-02 15:04:05"))
+
+	if err := b.telegramClient.SendPhotoToChat(captureCtx, chatID, imageData, contentType, caption); err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ Failed to send webcam photo: %v\n\nType /help for commands.", err))
+		return
+	}
 }
 
 // handleInterval sets or shows the capture interval

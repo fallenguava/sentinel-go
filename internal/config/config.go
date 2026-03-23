@@ -35,6 +35,11 @@ type Config struct {
 	CronIntervalMinutes  int
 	AlertIntervalSeconds int
 
+	// Webcam Configuration
+	WebcamDeviceName string // dshow device name, e.g. "Integrated Webcam"
+	WebcamFFmpegPath string // Windows path to ffmpeg.exe
+	WebcamCaptureDir string // Windows path to capture directory, e.g. F:\SentinelGo\webcam_captures
+
 	// Camera names (optional, for display purposes)
 	CameraNames map[int]string
 }
@@ -91,6 +96,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid ALERT_INTERVAL_SECONDS: %w", err)
 	}
 	cfg.AlertIntervalSeconds = alertInterval
+
+	// Webcam Configuration (optional)
+	cfg.WebcamDeviceName = getEnv("WEBCAM_DEVICE_NAME", "Integrated Webcam")
+	cfg.WebcamFFmpegPath = getEnv("WEBCAM_FFMPEG_PATH", `C:\tools\ffmpeg\bin\ffmpeg.exe`)
+	cfg.WebcamCaptureDir = getEnv("WEBCAM_CAPTURE_DIR", `F:\SentinelGo\webcam_captures`)
 
 	// Load camera names (optional)
 	// Format: CAM_1_NAME=Front Door, CAM_2_NAME=Backyard, etc.
