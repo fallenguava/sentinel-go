@@ -1,9 +1,11 @@
 package bot
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"html"
+	"image"
 	"log"
 	"os"
 	"regexp"
@@ -941,25 +943,97 @@ func (b *Bot) handleCapture(ctx context.Context, chatID string, args string) {
 
 // handleCam captures a frame from the laptop webcam and sends it via Telegram
 func (b *Bot) handleCam(ctx context.Context, chatID string) {
-	b.telegramClient.SendMessageToChat(ctx, chatID, "📷 Opening webcam...")
+	log.Printf("[BOT] [%s] Webcam: Starting 4-frame capture sequence", chatID)
 
-	captureCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+	b.telegramClient.SendMessageToChat(ctx, chatID, "📷 Processing... Capturing 4 frames with 2s intervals")
 
-	imageData, contentType, err := b.webcamClient.CaptureFrame(captureCtx)
+	const numFrames = 4
+	const intervalSeconds = 2
+	const captureTimeout = 30 * time.Second
+
+	var images []*imaging.CapturedImage
+	startTime := time.Now()
+
+	// Capture 4 frames with 2-second intervals
+	for frameNum := 1; frameNum <= numFrames; frameNum++ {
+		log.Printf("[BOT] [%s] Webcam: Capturing frame %d/%d", chatID, frameNum, numFrames)
+
+		captureCtx, cancel := context.WithTimeout(ctx, captureTimeout)
+		imageData, contentType, err := b.webcamClient.CaptureFrame(captureCtx)
+		cancel()
+
+		if err != nil {
+			log.Printf("[BOT] [%s] Webcam: Frame %d capture failed: %v", chatID, frameNum, err)
+			b.telegramClient.SendMessageToChat(ctx, chatID,
+				fmt.Sprintf("❌ Frame %d capture failed: %v\n\nType /help for commands.", frameNum, err))
+			return
+		}
+
+		log.Printf("[BOT] [%s] Webcam: Frame %d captured (%d bytes, %s)", chatID, frameNum, len(imageData), contentType)
+
+		// Decode the image
+		imgBuf := bytes.NewReader(imageData)
+		img, _, err := image.Decode(imgBuf)
+		if err != nil {
+			log.Printf("[BOT] [%s] Webcam: Failed to decode frame %d: %v", chatID, frameNum, err)
+			b.telegramClient.SendMessageToChat(ctx, chatID,
+				fmt.Sprintf("❌ Frame %d decode failed: %v\n\nType /help for commands.", frameNum, err))
+			return
+		}
+
+		images = append(images, &imaging.CapturedImage{
+			CamNumber: frameNum,
+			CamName:   fmt.Sprintf("Frame %d", frameNum),
+			Data:      imageData,
+			Image:     img,
+		})
+
+		log.Printf("[BOT] [%s] Webcam: Frame %d ready", chatID, frameNum)
+
+		// Wait 2 seconds before next capture (except after last frame)
+		if frameNum < numFrames {
+			log.Printf("[BOT] [%s] Webcam: Waiting %ds before next frame", chatID, intervalSeconds)
+			select {
+			case <-time.After(intervalSeconds * time.Second):
+				// Continue
+			case <-ctx.Done():
+				log.Printf("[BOT] [%s] Webcam: Capture interrupted", chatID)
+				b.telegramClient.SendMessageToChat(ctx, chatID, "⏹️ Capture cancelled.")
+				return
+			}
+		}
+	}
+
+	log.Printf("[BOT] [%s] Webcam: All 4 frames captured in %0.2fs, creating collage...", chatID, time.Since(startTime).Seconds())
+	b.telegramClient.SendMessageToChat(ctx, chatID, "🎨 Creating collage...")
+
+	// Create collage
+	collageConfig := imaging.DefaultCollageConfig()
+	collageData, err := imaging.CreateCollage(images, collageConfig)
 	if err != nil {
+		log.Printf("[BOT] [%s] Webcam: Collage creation failed: %v", chatID, err)
 		b.telegramClient.SendMessageToChat(ctx, chatID,
-			fmt.Sprintf("❌ Webcam capture failed: %v\n\nType /help for commands.", err))
+			fmt.Sprintf("❌ Collage creation failed: %v\n\nType /help for commands.", err))
 		return
 	}
 
-	caption := fmt.Sprintf("🖥️ Laptop Cam\n🕐 %s", time.Now().Format("2006-01-02 15:04:05"))
+	log.Printf("[BOT] [%s] Webcam: Collage created (%d bytes)", chatID, len(collageData))
 
-	if err := b.telegramClient.SendPhotoToChat(captureCtx, chatID, imageData, contentType, caption); err != nil {
+	// Send collage
+	caption := fmt.Sprintf("🖥️ Laptop Webcam - 4 Frame Sequence\n🕐 %s\n⏱️ Total time: %0.2fs",
+		time.Now().Format("2006-01-02 15:04:05"),
+		time.Since(startTime).Seconds())
+
+	log.Printf("[BOT] [%s] Webcam: Sending collage to Telegram...", chatID)
+	if err := b.telegramClient.SendPhotoToChat(ctx, chatID, collageData, "image/jpeg", caption); err != nil {
+		log.Printf("[BOT] [%s] Webcam: Failed to send collage: %v", chatID, err)
 		b.telegramClient.SendMessageToChat(ctx, chatID,
-			fmt.Sprintf("❌ Failed to send webcam photo: %v\n\nType /help for commands.", err))
+			fmt.Sprintf("❌ Failed to send collage: %v\n\nType /help for commands.", err))
 		return
 	}
+
+	log.Printf("[BOT] [%s] Webcam: ✅ Collage sent successfully", chatID)
+	b.telegramClient.SendMessageToChat(ctx, chatID, "✅ Webcam sequence complete!")
 }
 
 // handleInterval sets or shows the capture interval
