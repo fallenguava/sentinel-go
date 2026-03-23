@@ -53,9 +53,13 @@ func (c *Client) CaptureFrame(ctx context.Context) ([]byte, string, error) {
 
 	log.Printf("[WEBCAM] Capturing frame to %s", winFilePath)
 
+	// Escape backslashes for PowerShell - backslashes need to be doubled
+	escapedFFmpegPath := strings.ReplaceAll(c.ffmpegPath, "\\", "\\\\")
+	escapedWinFilePath := strings.ReplaceAll(winFilePath, "\\", "\\\\")
+
 	// Build ffmpeg command to run via PowerShell
 	ffmpegCmd := fmt.Sprintf(`& '%s' -y -f dshow -i "video=%s" -vframes 1 -q:v 2 -update 1 "%s"`,
-		c.ffmpegPath, c.deviceName, winFilePath)
+		escapedFFmpegPath, c.deviceName, escapedWinFilePath)
 
 	// Create PowerShell command with full WSL path
 	cmd := exec.CommandContext(ctx, "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-Command", ffmpegCmd)
