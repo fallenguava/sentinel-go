@@ -54,6 +54,11 @@ func (c *Client) CaptureFrame(ctx context.Context) ([]byte, string, error) {
 	winFilePath := c.captureDir + "\\" + filename
 	wslFilePath := winPathToWSL(winFilePath)
 
+	log.Printf("[WEBCAM] Device: %s", c.deviceName)
+	log.Printf("[WEBCAM] FFmpeg path: %s", c.ffmpegPath)
+	log.Printf("[WEBCAM] Capture dir: %s", c.captureDir)
+	log.Printf("[WEBCAM] Full Windows path: %s", winFilePath)
+	log.Printf("[WEBCAM] Full WSL path: %s", wslFilePath)
 	log.Printf("[WEBCAM] Capturing frame to %s", winFilePath)
 
 	// Build ffmpeg command to run via PowerShell
