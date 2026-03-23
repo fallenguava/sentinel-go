@@ -152,6 +152,77 @@ func (c *Client) SendPhotoToChat(ctx context.Context, chatID string, imageData [
 	return nil
 }
 
+// SendDocument sends a file to the configured Telegram chat
+func (c *Client) SendDocument(ctx context.Context, fileData []byte, filename, caption string) error {
+	return c.SendDocumentToChat(ctx, c.chatID, fileData, filename, caption)
+}
+
+// SendDocumentToChat sends a file to a specific chat
+func (c *Client) SendDocumentToChat(ctx context.Context, chatID string, fileData []byte, filename, caption string) error {
+	log.Printf("[TELEGRAM] Preparing to send document (%d bytes) to chat %s", len(fileData), chatID)
+
+	apiURL := fmt.Sprintf("%s/bot%s/sendDocument", c.apiBaseURL, c.botToken)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	if err := writer.WriteField("chat_id", chatID); err != nil {
+		return fmt.Errorf("failed to write chat_id field: %w", err)
+	}
+
+	if caption != "" {
+		if err := writer.WriteField("caption", caption); err != nil {
+			return fmt.Errorf("failed to write caption field: %w", err)
+		}
+		if err := writer.WriteField("parse_mode", "HTML"); err != nil {
+			return fmt.Errorf("failed to write parse_mode field: %w", err)
+		}
+	}
+
+	part, err := writer.CreateFormFile("document", filename)
+	if err != nil {
+		return fmt.Errorf("failed to create form file: %w", err)
+	}
+
+	if _, err := part.Write(fileData); err != nil {
+		return fmt.Errorf("failed to write document data: %w", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, body)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var apiResp APIResponse
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return fmt.Errorf("failed to parse API response: %w", err)
+	}
+
+	if !apiResp.OK {
+		return fmt.Errorf("Telegram API error: %s", apiResp.Description)
+	}
+
+	log.Printf("[TELEGRAM] Successfully sent document to chat %s", chatID)
+	return nil
+}
+
 // SendMessage sends a text message to the configured Telegram chat
 func (c *Client) SendMessage(ctx context.Context, message string) error {
 	return c.SendMessageToChat(ctx, c.chatID, message)

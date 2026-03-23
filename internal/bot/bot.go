@@ -6,9 +6,14 @@ import (
 	"fmt"
 	"html"
 	"image"
+	"image/color/palette"
+	"image/draw"
+	"image/gif"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -398,7 +403,7 @@ func (b *Bot) executeCommand(ctx context.Context, chatID int64, chatIDStr string
 	case "capture", "snap", "c":
 		b.handleCapture(ctx, chatIDStr, cmd.Args)
 	case "cam", "webcam":
-		b.handleCam(ctx, chatIDStr)
+		b.handleCam(ctx, chatIDStr, cmd.Args)
 	case "interval", "int":
 		b.handleInterval(ctx, chatIDStr, cmd.Args)
 	case "enable", "on":
@@ -530,6 +535,9 @@ func (b *Bot) handleHelp(ctx context.Context, chatID, role string) {
 
 /cam - Capture laptop webcam (on-demand)
   <i>Shortcut: /webcam</i>
+	<code>/cam gif</code> - Capture as animated GIF (fast)
+	<code>/cam list</code> - Show last 20 webcam captures
+	<code>/cam show [n]</code> - Send capture by list number
 
 <b>⚙️ Settings:</b>
 /interval [min] - Set capture interval
@@ -585,6 +593,9 @@ Type /help anytime to see this menu.`
 
 /cam - Capture laptop webcam (on-demand)
   <i>Shortcut: /webcam</i>
+	<code>/cam gif</code> - Capture as animated GIF (fast)
+	<code>/cam list</code> - Show last 20 webcam captures
+	<code>/cam show [n]</code> - Send capture by list number
 
 <b>⚙️ Settings:</b>
 /interval [min] - Set capture interval
@@ -941,44 +952,130 @@ func (b *Bot) handleCapture(ctx context.Context, chatID string, args string) {
 	b.captureAndSend(ctx, chatID, cameras, false)
 }
 
-// handleCam captures a frame from the laptop webcam and sends it via Telegram
-func (b *Bot) handleCam(ctx context.Context, chatID string) {
-	log.Printf("[BOT] [%s] Webcam: Starting 4-frame capture sequence", chatID)
+// handleCam supports webcam capture modes:
+// - /cam or /webcam: 4-frame collage with interval
+// - /cam gif: 4-frame animated GIF with short interval
+// - /cam list: show last 20 captures
+// - /cam show [n]: send selected capture from list
+func (b *Bot) handleCam(ctx context.Context, chatID string, args string) {
+	mode := strings.ToLower(strings.TrimSpace(args))
 
-	b.telegramClient.SendMessageToChat(ctx, chatID, "📷 Processing... Capturing 4 frames with 2s intervals")
-
-	const numFrames = 4
-	const intervalSeconds = 2
-	const captureTimeout = 30 * time.Second
-
-	var images []*imaging.CapturedImage
-	startTime := time.Now()
-
-	// Capture 4 frames with 2-second intervals
-	for frameNum := 1; frameNum <= numFrames; frameNum++ {
-		log.Printf("[BOT] [%s] Webcam: Capturing frame %d/%d", chatID, frameNum, numFrames)
-
-		captureCtx, cancel := context.WithTimeout(ctx, captureTimeout)
-		imageData, contentType, err := b.webcamClient.CaptureFrame(captureCtx)
-		cancel()
-
-		if err != nil {
-			log.Printf("[BOT] [%s] Webcam: Frame %d capture failed: %v", chatID, frameNum, err)
-			b.telegramClient.SendMessageToChat(ctx, chatID,
-				fmt.Sprintf("❌ Frame %d capture failed: %v\n\nType /help for commands.", frameNum, err))
+	switch {
+	case mode == "":
+		b.handleCamCollage(ctx, chatID)
+	case mode == "gif":
+		b.handleCamGIF(ctx, chatID)
+	case mode == "list" || mode == "history":
+		b.handleCamList(ctx, chatID)
+	case strings.HasPrefix(mode, "show "):
+		index, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(mode, "show ")))
+		if err != nil || index <= 0 {
+			b.telegramClient.SendMessageToChat(ctx, chatID, "❌ Usage: /cam show [number]\n\nType /cam list first.")
 			return
 		}
-
-		log.Printf("[BOT] [%s] Webcam: Frame %d captured (%d bytes, %s)", chatID, frameNum, len(imageData), contentType)
-
-		// Decode the image
-		imgBuf := bytes.NewReader(imageData)
-		img, _, err := image.Decode(imgBuf)
-		if err != nil {
-			log.Printf("[BOT] [%s] Webcam: Failed to decode frame %d: %v", chatID, frameNum, err)
-			b.telegramClient.SendMessageToChat(ctx, chatID,
-				fmt.Sprintf("❌ Frame %d decode failed: %v\n\nType /help for commands.", frameNum, err))
+		b.handleCamShow(ctx, chatID, index)
+	case mode != "":
+		index, err := strconv.Atoi(mode)
+		if err == nil && index > 0 {
+			b.handleCamShow(ctx, chatID, index)
 			return
+		}
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			"❌ Unknown webcam command.\n\nUse:\n• /cam\n• /cam gif\n• /cam list\n• /cam show [number]")
+		return
+	default:
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			"❌ Unknown webcam command.\n\nUse:\n• /cam\n• /cam gif\n• /cam list\n• /cam show [number]")
+	}
+}
+
+func (b *Bot) handleCamCollage(ctx context.Context, chatID string) {
+	log.Printf("[BOT] [%s] Webcam: Starting 4-frame collage sequence", chatID)
+	b.telegramClient.SendMessageToChat(ctx, chatID, "📷 Processing... Capturing 4 frames with 2s intervals")
+
+	images, err := b.captureWebcamFrames(ctx, chatID, 4, 2*time.Second, 30*time.Second)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ Webcam capture failed: %v\n\nType /help for commands.", err))
+		return
+	}
+
+	startTime := time.Now()
+	b.telegramClient.SendMessageToChat(ctx, chatID, "🎨 Creating collage...")
+	collageData, err := imaging.CreateCollage(images, imaging.DefaultCollageConfig())
+	if err != nil {
+		log.Printf("[BOT] [%s] Webcam: Collage creation failed: %v", chatID, err)
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ Collage creation failed: %v\n\nType /help for commands.", err))
+		return
+	}
+
+	if err := b.saveWebcamOutput("collage", ".jpg", collageData); err != nil {
+		log.Printf("[BOT] [%s] Webcam: Failed to save collage history: %v", chatID, err)
+	}
+
+	caption := fmt.Sprintf("🖥️ Laptop Webcam - 4 Frame Collage\n🕐 %s", time.Now().Format("2006-01-02 15:04:05"))
+	if err := b.telegramClient.SendPhotoToChat(ctx, chatID, collageData, "image/jpeg", caption); err != nil {
+		log.Printf("[BOT] [%s] Webcam: Failed to send collage: %v", chatID, err)
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ Failed to send collage: %v\n\nType /help for commands.", err))
+		return
+	}
+
+	log.Printf("[BOT] [%s] Webcam: ✅ Collage sent successfully in %0.2fs", chatID, time.Since(startTime).Seconds())
+}
+
+func (b *Bot) handleCamGIF(ctx context.Context, chatID string) {
+	log.Printf("[BOT] [%s] Webcam: Starting 4-frame GIF sequence", chatID)
+	b.telegramClient.SendMessageToChat(ctx, chatID, "🎞️ Processing... Capturing 4 frames for GIF (0.5s intervals)")
+
+	images, err := b.captureWebcamFrames(ctx, chatID, 4, 500*time.Millisecond, 20*time.Second)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ GIF capture failed: %v\n\nType /help for commands.", err))
+		return
+	}
+
+	b.telegramClient.SendMessageToChat(ctx, chatID, "🎬 Building animated GIF...")
+	gifData, err := createAnimatedGIF(images, 40)
+	if err != nil {
+		log.Printf("[BOT] [%s] Webcam: GIF creation failed: %v", chatID, err)
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ GIF creation failed: %v\n\nType /help for commands.", err))
+		return
+	}
+
+	if err := b.saveWebcamOutput("gif", ".gif", gifData); err != nil {
+		log.Printf("[BOT] [%s] Webcam: Failed to save GIF history: %v", chatID, err)
+	}
+
+	caption := fmt.Sprintf("🎞️ Laptop Webcam GIF (4 frames)\n🕐 %s", time.Now().Format("2006-01-02 15:04:05"))
+	if err := b.telegramClient.SendDocumentToChat(ctx, chatID, gifData, "webcam_capture.gif", caption); err != nil {
+		log.Printf("[BOT] [%s] Webcam: Failed to send GIF: %v", chatID, err)
+		b.telegramClient.SendMessageToChat(ctx, chatID,
+			fmt.Sprintf("❌ Failed to send GIF: %v\n\nType /help for commands.", err))
+		return
+	}
+
+	log.Printf("[BOT] [%s] Webcam: ✅ GIF sent successfully", chatID)
+}
+
+func (b *Bot) captureWebcamFrames(ctx context.Context, chatID string, frameCount int, interval time.Duration, timeout time.Duration) ([]*imaging.CapturedImage, error) {
+	var images []*imaging.CapturedImage
+
+	for frameNum := 1; frameNum <= frameCount; frameNum++ {
+		log.Printf("[BOT] [%s] Webcam: Capturing frame %d/%d", chatID, frameNum, frameCount)
+
+		captureCtx, cancel := context.WithTimeout(ctx, timeout)
+		imageData, contentType, err := b.webcamClient.CaptureFrame(captureCtx)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("frame %d capture failed: %w", frameNum, err)
+		}
+
+		img, _, err := image.Decode(bytes.NewReader(imageData))
+		if err != nil {
+			return nil, fmt.Errorf("frame %d decode failed: %w", frameNum, err)
 		}
 
 		images = append(images, &imaging.CapturedImage{
@@ -988,52 +1085,165 @@ func (b *Bot) handleCam(ctx context.Context, chatID string) {
 			Image:     img,
 		})
 
-		log.Printf("[BOT] [%s] Webcam: Frame %d ready", chatID, frameNum)
+		log.Printf("[BOT] [%s] Webcam: Frame %d captured (%d bytes, %s)", chatID, frameNum, len(imageData), contentType)
 
-		// Wait 2 seconds before next capture (except after last frame)
-		if frameNum < numFrames {
-			log.Printf("[BOT] [%s] Webcam: Waiting %ds before next frame", chatID, intervalSeconds)
+		if frameNum < frameCount {
 			select {
-			case <-time.After(intervalSeconds * time.Second):
-				// Continue
+			case <-time.After(interval):
 			case <-ctx.Done():
-				log.Printf("[BOT] [%s] Webcam: Capture interrupted", chatID)
-				b.telegramClient.SendMessageToChat(ctx, chatID, "⏹️ Capture cancelled.")
-				return
+				return nil, fmt.Errorf("capture interrupted")
 			}
 		}
 	}
 
-	log.Printf("[BOT] [%s] Webcam: All 4 frames captured in %0.2fs, creating collage...", chatID, time.Since(startTime).Seconds())
-	b.telegramClient.SendMessageToChat(ctx, chatID, "🎨 Creating collage...")
+	return images, nil
+}
 
-	// Create collage
-	collageConfig := imaging.DefaultCollageConfig()
-	collageData, err := imaging.CreateCollage(images, collageConfig)
+func createAnimatedGIF(images []*imaging.CapturedImage, delay int) ([]byte, error) {
+	if len(images) == 0 {
+		return nil, fmt.Errorf("no frames to encode")
+	}
+
+	out := &gif.GIF{}
+	for _, frame := range images {
+		bounds := frame.Image.Bounds()
+		paletted := image.NewPaletted(bounds, palette.Plan9)
+		draw.FloydSteinberg.Draw(paletted, bounds, frame.Image, image.Point{})
+		out.Image = append(out.Image, paletted)
+		out.Delay = append(out.Delay, delay)
+	}
+
+	buf := &bytes.Buffer{}
+	if err := gif.EncodeAll(buf, out); err != nil {
+		return nil, fmt.Errorf("failed to encode gif: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+type webcamHistoryItem struct {
+	Name    string
+	Path    string
+	ModTime time.Time
+	Size    int64
+}
+
+func (b *Bot) handleCamList(ctx context.Context, chatID string) {
+	items, err := b.getWebcamHistory(20)
 	if err != nil {
-		log.Printf("[BOT] [%s] Webcam: Collage creation failed: %v", chatID, err)
-		b.telegramClient.SendMessageToChat(ctx, chatID,
-			fmt.Sprintf("❌ Collage creation failed: %v\n\nType /help for commands.", err))
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to read webcam history: %v", err))
+		return
+	}
+	if len(items) == 0 {
+		b.telegramClient.SendMessageToChat(ctx, chatID, "ℹ️ No webcam captures found yet.")
 		return
 	}
 
-	log.Printf("[BOT] [%s] Webcam: Collage created (%d bytes)", chatID, len(collageData))
+	lines := []string{"🗂️ <b>Last 20 Webcam Captures</b>", ""}
+	for i, item := range items {
+		lines = append(lines, fmt.Sprintf("%d. %s (%s)", i+1, html.EscapeString(item.Name), item.ModTime.Format("2006-01-02 15:04:05")))
+	}
+	lines = append(lines, "", "Use <code>/cam show [number]</code> to view one capture.")
+	b.telegramClient.SendMessageToChat(ctx, chatID, strings.Join(lines, "\n"))
+}
 
-	// Send collage
-	caption := fmt.Sprintf("🖥️ Laptop Webcam - 4 Frame Sequence\n🕐 %s\n⏱️ Total time: %0.2fs",
-		time.Now().Format("2006-01-02 15:04:05"),
-		time.Since(startTime).Seconds())
-
-	log.Printf("[BOT] [%s] Webcam: Sending collage to Telegram...", chatID)
-	if err := b.telegramClient.SendPhotoToChat(ctx, chatID, collageData, "image/jpeg", caption); err != nil {
-		log.Printf("[BOT] [%s] Webcam: Failed to send collage: %v", chatID, err)
-		b.telegramClient.SendMessageToChat(ctx, chatID,
-			fmt.Sprintf("❌ Failed to send collage: %v\n\nType /help for commands.", err))
+func (b *Bot) handleCamShow(ctx context.Context, chatID string, index int) {
+	items, err := b.getWebcamHistory(20)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to read webcam history: %v", err))
+		return
+	}
+	if index < 1 || index > len(items) {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Invalid capture number. Choose 1-%d.", len(items)))
 		return
 	}
 
-	log.Printf("[BOT] [%s] Webcam: ✅ Collage sent successfully", chatID)
-	b.telegramClient.SendMessageToChat(ctx, chatID, "✅ Webcam sequence complete!")
+	item := items[index-1]
+	data, err := os.ReadFile(item.Path)
+	if err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to read capture: %v", err))
+		return
+	}
+
+	caption := fmt.Sprintf("🗂️ Webcam Capture #%d\n🕐 %s\n📄 %s", index, item.ModTime.Format("2006-01-02 15:04:05"), item.Name)
+	if strings.HasSuffix(strings.ToLower(item.Name), ".gif") {
+		if err := b.telegramClient.SendDocumentToChat(ctx, chatID, data, item.Name, caption); err != nil {
+			b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to send capture: %v", err))
+			return
+		}
+		return
+	}
+
+	if err := b.telegramClient.SendPhotoToChat(ctx, chatID, data, "image/jpeg", caption); err != nil {
+		b.telegramClient.SendMessageToChat(ctx, chatID, fmt.Sprintf("❌ Failed to send capture: %v", err))
+	}
+}
+
+func (b *Bot) getWebcamHistory(limit int) ([]webcamHistoryItem, error) {
+	dir := winPathToWSLPath(b.cfg.WebcamCaptureDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read capture directory %s: %w", dir, err)
+	}
+
+	items := make([]webcamHistoryItem, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		nameLower := strings.ToLower(entry.Name())
+		if !strings.HasSuffix(nameLower, ".jpg") && !strings.HasSuffix(nameLower, ".jpeg") && !strings.HasSuffix(nameLower, ".gif") {
+			continue
+		}
+
+		fullPath := filepath.Join(dir, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		items = append(items, webcamHistoryItem{
+			Name:    entry.Name(),
+			Path:    fullPath,
+			ModTime: info.ModTime(),
+			Size:    info.Size(),
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].ModTime.After(items[j].ModTime)
+	})
+
+	if len(items) > limit {
+		items = items[:limit]
+	}
+
+	return items, nil
+}
+
+func (b *Bot) saveWebcamOutput(kind, ext string, data []byte) error {
+	timestamp := time.Now().Format("20060102_150405")
+	name := fmt.Sprintf("sentinel_cam_%s_%s_%s%s", kind, timestamp, generateShortID(), ext)
+	winPath := b.cfg.WebcamCaptureDir + "\\" + name
+	wslPath := winPathToWSLPath(winPath)
+
+	if err := os.WriteFile(wslPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write %s: %w", wslPath, err)
+	}
+	log.Printf("[BOT] Webcam: Saved %s output to %s", kind, wslPath)
+	return nil
+}
+
+func generateShortID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano()%1000000)
+}
+
+func winPathToWSLPath(p string) string {
+	p = strings.ReplaceAll(p, "\\", "/")
+	if len(p) >= 2 && p[1] == ':' {
+		drive := strings.ToLower(string(p[0]))
+		p = fmt.Sprintf("/mnt/%s%s", drive, p[2:])
+	}
+	return p
 }
 
 // handleInterval sets or shows the capture interval
