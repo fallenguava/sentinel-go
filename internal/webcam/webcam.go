@@ -9,7 +9,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -50,7 +49,9 @@ func (c *Client) CaptureFrame(ctx context.Context) ([]byte, string, error) {
 	filename := fmt.Sprintf("sentinel_cam_%s_%s.jpg", timestamp, randomSuffix)
 
 	// Build full Windows and WSL paths
-	winFilePath := filepath.Join(c.captureDir, filename)
+	// Use backslash directly instead of filepath.Join since we're always on Windows paths,
+	// even when running in WSL. filepath.Join would use / separator on Linux hosts.
+	winFilePath := c.captureDir + "\\" + filename
 	wslFilePath := winPathToWSL(winFilePath)
 
 	log.Printf("[WEBCAM] Capturing frame to %s", winFilePath)
