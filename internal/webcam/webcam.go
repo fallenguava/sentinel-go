@@ -3,6 +3,7 @@ package webcam
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 // Client captures frames from the laptop webcam via PowerShell + ffmpeg (dshow) from WSL
@@ -53,17 +55,20 @@ func (c *Client) CaptureFrame(ctx context.Context) ([]byte, string, error) {
 
 	log.Printf("[WEBCAM] Capturing frame to %s", winFilePath)
 
-	// Convert backslashes to forward slashes for PowerShell - Windows accepts both
-	// This avoids escape character issues when passing through PowerShell's -Command
-	psFFmpegPath := strings.ReplaceAll(c.ffmpegPath, "\\", "/")
-	psWinFilePath := strings.ReplaceAll(winFilePath, "\\", "/")
-
 	// Build ffmpeg command to run via PowerShell
+	// Use backslashes with proper quoting since we'll use -EncodedCommand
 	ffmpegCmd := fmt.Sprintf(`& '%s' -y -f dshow -i "video=%s" -vframes 1 -q:v 2 -update 1 "%s"`,
-		psFFmpegPath, c.deviceName, psWinFilePath)
+		c.ffmpegPath, c.deviceName, winFilePath)
 
-	// Create PowerShell command with full WSL path
-	cmd := exec.CommandContext(ctx, "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-Command", ffmpegCmd)
+	// Encode command as UTF-16 LE base64 for PowerShell's -EncodedCommand
+	// This bypasses PowerShell's string parsing, avoiding backslash issues
+	encoded, err := encodeForPowerShell(ffmpegCmd)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to encode command: %w", err)
+	}
+
+	// Create PowerShell command with encoded version
+	cmd := exec.CommandContext(ctx, "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-EncodedCommand", encoded)
 
 	// Run the command with output capture for logging
 	output, err := cmd.CombinedOutput()
@@ -123,6 +128,22 @@ func winPathToWSL(p string) string {
 	}
 
 	return p
+}
+
+// encodeForPowerShell encodes a command string as UTF-16 LE base64 for PowerShell's -EncodedCommand
+// This bypasses PowerShell's string parsing, avoiding backslash escape issues
+func encodeForPowerShell(cmd string) (string, error) {
+	// Convert to UTF-16 LE (PowerShell's native encoding)
+	utf16Bytes := utf16.Encode([]rune(cmd))
+	// Convert UTF-16 uint16 slice to byte slice (little-endian)
+	byteArray := make([]byte, len(utf16Bytes)*2)
+	for i, v := range utf16Bytes {
+		byteArray[i*2] = byte(v)
+		byteArray[i*2+1] = byte(v >> 8)
+	}
+	// Encode to base64
+	encoded := base64.StdEncoding.EncodeToString(byteArray)
+	return encoded, nil
 }
 
 // generateRandomHex generates n random bytes and returns them as a hex string
