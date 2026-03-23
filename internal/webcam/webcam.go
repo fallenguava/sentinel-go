@@ -57,8 +57,8 @@ func (c *Client) CaptureFrame(ctx context.Context) ([]byte, string, error) {
 	ffmpegCmd := fmt.Sprintf(`& '%s' -y -f dshow -i "video=%s" -vframes 1 -q:v 2 -update 1 "%s"`,
 		c.ffmpegPath, c.deviceName, winFilePath)
 
-	// Create PowerShell command
-	cmd := exec.CommandContext(ctx, "powershell.exe", "-Command", ffmpegCmd)
+	// Create PowerShell command with full WSL path
+	cmd := exec.CommandContext(ctx, "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-Command", ffmpegCmd)
 
 	// Run the command with output capture for logging
 	output, err := cmd.CombinedOutput()
