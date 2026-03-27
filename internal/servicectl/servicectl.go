@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,6 +21,14 @@ var monitoredServices = []string{
 	"cloudflared",
 	"netdata",
 }
+
+var monitoredServiceSet = func() map[string]struct{} {
+	set := make(map[string]struct{}, len(monitoredServices))
+	for _, service := range monitoredServices {
+		set[service] = struct{}{}
+	}
+	return set
+}()
 
 // ServiceStatus stores normalized and raw service status values.
 type ServiceStatus struct {
@@ -39,12 +48,8 @@ func MonitoredServices() []string {
 // IsAllowedService validates that a service is in the allowlist.
 func IsAllowedService(service string) bool {
 	service = strings.TrimSpace(service)
-	for _, allowed := range monitoredServices {
-		if service == allowed {
-			return true
-		}
-	}
-	return false
+	_, ok := monitoredServiceSet[service]
+	return ok
 }
 
 // GetServiceStatus returns the current state of one service.
@@ -78,10 +83,9 @@ func GetServiceStatus(service string) (*ServiceStatus, error) {
 
 // ListStatuses returns status information for all monitored services.
 func ListStatuses() ([]*ServiceStatus, error) {
-	services := MonitoredServices()
-	statuses := make([]*ServiceStatus, 0, len(services))
+	statuses := make([]*ServiceStatus, 0, len(monitoredServices))
 
-	for _, service := range services {
+	for _, service := range monitoredServices {
 		status, err := GetServiceStatus(service)
 		if err != nil {
 			return nil, err
@@ -116,7 +120,7 @@ func GetLogs(service string, lines int) (string, error) {
 		lines = 20
 	}
 
-	cmd := exec.Command("sudo", "-n", "journalctl", "-u", service, "-n", fmt.Sprintf("%d", lines), "--no-pager")
+	cmd := exec.Command("sudo", "-n", "journalctl", "-u", service, "-n", strconv.Itoa(lines), "--no-pager")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("failed to read logs for %s: %w", service, err)

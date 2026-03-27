@@ -173,7 +173,7 @@ func ParseCameras(input string, maxCams int) ([]int, error) {
 		return cams, nil
 	}
 
-	camSet := make(map[int]bool)
+	selected := make([]bool, maxCams+1)
 	parts := strings.Split(input, ",")
 
 	for _, part := range parts {
@@ -202,7 +202,7 @@ func ParseCameras(input string, maxCams int) ([]int, error) {
 
 			for i := start; i <= end; i++ {
 				if i >= 1 && i <= maxCams {
-					camSet[i] = true
+					selected[i] = true
 				}
 			}
 		} else {
@@ -212,19 +212,25 @@ func ParseCameras(input string, maxCams int) ([]int, error) {
 				return nil, fmt.Errorf("invalid camera number: %s", part)
 			}
 			if num >= 1 && num <= maxCams {
-				camSet[num] = true
+				selected[num] = true
 			}
 		}
 	}
 
-	if len(camSet) == 0 {
+	count := 0
+	for i := 1; i <= maxCams; i++ {
+		if selected[i] {
+			count++
+		}
+	}
+	if count == 0 {
 		return nil, fmt.Errorf("no valid cameras specified")
 	}
 
 	// Convert set to sorted slice
-	cams := make([]int, 0, len(camSet))
+	cams := make([]int, 0, count)
 	for i := 1; i <= maxCams; i++ {
-		if camSet[i] {
+		if selected[i] {
 			cams = append(cams, i)
 		}
 	}

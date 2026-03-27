@@ -14,6 +14,12 @@ import (
 	"time"
 )
 
+type sendMessagePayload struct {
+	ChatID    string `json:"chat_id"`
+	Text      string `json:"text"`
+	ParseMode string `json:"parse_mode"`
+}
+
 // Client handles communication with the Telegram Bot API
 type Client struct {
 	httpClient *http.Client
@@ -234,10 +240,10 @@ func (c *Client) SendMessageToChat(ctx context.Context, chatID string, message s
 
 	apiURL := fmt.Sprintf("%s/bot%s/sendMessage", c.apiBaseURL, c.botToken)
 
-	payload := map[string]interface{}{
-		"chat_id":    chatID,
-		"text":       message,
-		"parse_mode": "HTML",
+	payload := sendMessagePayload{
+		ChatID:    chatID,
+		Text:      message,
+		ParseMode: "HTML",
 	}
 
 	jsonData, err := json.Marshal(payload)
@@ -286,12 +292,7 @@ func (c *Client) GetUpdates(ctx context.Context, offset int, timeout int) ([]Upd
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Use a longer client timeout for long polling
-	client := &http.Client{
-		Timeout: time.Duration(timeout+10) * time.Second,
-	}
-
-	resp, err := client.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get updates: %w", err)
 	}
